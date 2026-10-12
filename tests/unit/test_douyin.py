@@ -92,6 +92,43 @@ def test_quality_selection_prefers_h264_at_same_resolution() -> None:
     assert selected.urls == ("https://v3.douyinvod.com/h264.mp4",)
 
 
+def test_detail_request_passes_imported_uifid_before_signing(monkeypatch: pytest.MonkeyPatch) -> None:
+    signed_params: list[str] = []
+
+    def sign(self, params: str):
+        signed_params.append(params)
+        return (params, "test-signature", "", "")
+
+    monkeypatch.setattr("video_sum_core.douyin.ABogus.generate_abogus", sign)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("uifid") != "browser-device-id":
+            return httpx.Response(403, text="Blocked by ArgusSecurityPlugin Uifid Not Found")
+        return httpx.Response(200, json=_detail_payload())
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        downloader = DouyinDownloader(client=client, cookie_header="sessionid=test; UIFID=browser-device-id")
+        assert downloader.probe("https://www.douyin.com/video/6961737553342991651").aweme_id == "6961737553342991651"
+    assert "uifid=browser-device-id" in signed_params[0]
+
+
+@pytest.mark.parametrize("reason, expected", [
+    ("Uifid Not Found", "浏览器标识 UIFID"),
+    ("Signature Not Found", "浏览器请求签名"),
+])
+def test_security_plugin_errors_do_not_misreport_cookie_expiry(reason: str, expected: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text=f"Blocked by ArgusSecurityPlugin {reason}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        downloader = DouyinDownloader(client=client, cookie_header="sessionid=private-session")
+        with pytest.raises(DouyinError) as caught:
+            downloader.probe("https://www.douyin.com/video/6961737553342991651")
+    assert expected in str(caught.value)
+    assert "登录态已失效" not in str(caught.value)
+    assert "private-session" not in str(caught.value)
+
+
 def test_missing_douyin_cookie_has_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VIDEO_SUM_DOUYIN_COOKIE", raising=False)
     monkeypatch.delenv("DOUYIN_COOKIE", raising=False)

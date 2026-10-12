@@ -382,7 +382,11 @@ class DouyinDownloader:
         )
 
     def _fetch_detail(self, item_id: str) -> dict[str, object]:
-        params_text = urlencode(_api_params(item_id))
+        params_values = _api_params(item_id)
+        uifid = _parse_cookie_header(self.cookie_header).get("UIFID")
+        if uifid:
+            params_values["uifid"] = uifid
+        params_text = urlencode(params_values)
         fingerprint = BrowserFingerprintGenerator.generate_fingerprint("Edge")
         signature = ABogus(fp=fingerprint, user_agent=DOUYIN_API_USER_AGENT).generate_abogus(params_text)[1]
         params = f"{params_text}&a_bogus={quote(signature, safe='')}"
@@ -405,9 +409,25 @@ class DouyinDownloader:
             )
         except httpx.HTTPError as exc:
             raise DouyinError(f"抖音详情请求失败：{exc}") from exc
-        if response.status_code in {401, 403}:
+        if response.status_code == 403:
+            reason = response.text.lower()
+            if "uifid not found" in reason:
+                raise DouyinError(
+                    "抖音详情请求缺少浏览器标识 UIFID（HTTP 403）。"
+                    "请从已登录的抖音作品页导出完整 Cookies。"
+                )
+            if "signature not found" in reason:
+                raise DouyinError(
+                    "抖音详情请求缺少浏览器请求签名（HTTP 403）。"
+                    "Cookies 已发送，但当前接口请求仍未被接受；重复导入相同 Cookies 无法解决。"
+                )
             raise DouyinError(
-                "抖音登录态已失效或请求被风控拦截，请更新 cookies.txt 或 VIDEO_SUM_DOUYIN_COOKIE。"
+                "抖音拒绝了视频详情请求（HTTP 403）。可能是接口校验或访问限制，"
+                "此响应不能确认 Cookies 是否过期。"
+            )
+        if response.status_code == 401:
+            raise DouyinError(
+                "抖音详情请求未授权（HTTP 401），请重新登录后导入完整 Cookies。"
             )
         try:
             response.raise_for_status()
