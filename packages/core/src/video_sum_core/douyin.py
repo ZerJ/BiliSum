@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import os
 import random
@@ -8,8 +9,9 @@ import string
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from time import time
 from typing import Callable, Iterable
-from urllib.parse import quote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse
 
 import httpx
 
@@ -289,6 +291,21 @@ def _parse_cookie_header(value: str) -> dict[str, str]:
     return cookies
 
 
+def _web_sign_query(query: str, uifid: str) -> tuple[str, dict[str, str]]:
+    """Match the site's web SDK query encoding and per-request checksum."""
+    timestamp = str(int(time()))
+    pairs = [*parse_qsl(query, keep_blank_values=True), ("timestamp", timestamp)]
+    encoded = [(name, quote(value, safe="~()*!.'-_")) for name, value in pairs]
+    canonical = "&".join(f"{name}={value}" for name, value in encoded)
+    material = "_".join((uifid, timestamp, "A96D855A08C0A9707F8BEF0D9A527E4E", canonical))
+    signature = hashlib.md5(material.encode("utf-8"), usedforsecurity=False).hexdigest()
+    return f"{canonical}&x-secsdk-web-signature={signature}", {
+        "uifid": uifid,
+        "x-secsdk-web-signature": signature,
+        "x-secsdk-web-expire": timestamp,
+    }
+
+
 class DouyinDownloader:
     def __init__(
         self,
@@ -383,13 +400,17 @@ class DouyinDownloader:
 
     def _fetch_detail(self, item_id: str) -> dict[str, object]:
         params_values = _api_params(item_id)
-        uifid = _parse_cookie_header(self.cookie_header).get("UIFID")
+        cookies = _parse_cookie_header(self.cookie_header)
+        uifid = cookies.get("UIFID") or cookies.get("UIFID_TEMP") or cookies.get("UIFIDTEMP")
         if uifid:
             params_values["uifid"] = uifid
         params_text = urlencode(params_values)
         fingerprint = BrowserFingerprintGenerator.generate_fingerprint("Edge")
         signature = ABogus(fp=fingerprint, user_agent=DOUYIN_API_USER_AGENT).generate_abogus(params_text)[1]
         params = f"{params_text}&a_bogus={quote(signature, safe='')}"
+        web_headers: dict[str, str] = {}
+        if uifid:
+            params, web_headers = _web_sign_query(params, uifid)
         headers = {
             "User-Agent": DOUYIN_API_USER_AGENT,
             "Referer": f"https://www.douyin.com/video/{item_id}",
@@ -400,6 +421,7 @@ class DouyinDownloader:
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
         }
+        headers.update(web_headers)
         try:
             response = self._client.get(
                 f"{DOUYIN_DETAIL_ENDPOINT}?{params}",

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import parse_qsl
 
 import httpx
 import pytest
 
+import video_sum_core.douyin as douyin
 from video_sum_core.douyin import (
     DouyinDownloader,
     DouyinError,
@@ -92,7 +94,10 @@ def test_quality_selection_prefers_h264_at_same_resolution() -> None:
     assert selected.urls == ("https://v3.douyinvod.com/h264.mp4",)
 
 
-def test_detail_request_passes_imported_uifid_before_signing(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("cookie_name", ["UIFID", "UIFID_TEMP", "UIFIDTEMP"])
+def test_detail_request_passes_imported_uifid_before_signing(
+    monkeypatch: pytest.MonkeyPatch, cookie_name: str,
+) -> None:
     signed_params: list[str] = []
 
     def sign(self, params: str):
@@ -107,9 +112,55 @@ def test_detail_request_passes_imported_uifid_before_signing(monkeypatch: pytest
         return httpx.Response(200, json=_detail_payload())
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        downloader = DouyinDownloader(client=client, cookie_header="sessionid=test; UIFID=browser-device-id")
+        downloader = DouyinDownloader(
+            client=client, cookie_header=f"sessionid=test; {cookie_name}=browser-device-id",
+        )
         assert downloader.probe("https://www.douyin.com/video/6961737553342991651").aweme_id == "6961737553342991651"
     assert "uifid=browser-device-id" in signed_params[0]
+
+
+def test_web_signature_matches_browser_sdk_vector(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(douyin, "time", lambda: 1791795817)
+    query = (
+        "aweme_id=7695291560069483814&uifid=test-device"
+        "&a_bogus=a%2Bb%2Fc%3D&empty=&title=%E6%B5%8B%E8%AF%95+video"
+    )
+    signed, headers = douyin._web_sign_query(query, "test-device")
+    assert signed == (
+        "aweme_id=7695291560069483814&uifid=test-device"
+        "&a_bogus=a%2Bb%2Fc%3D&empty=&title=%E6%B5%8B%E8%AF%95%20video"
+        "&timestamp=1791795817&x-secsdk-web-signature=caa33fc595c8c65bd6d9d12cf70a1bb2"
+    )
+    assert headers == {
+        "uifid": "test-device",
+        "x-secsdk-web-signature": "caa33fc595c8c65bd6d9d12cf70a1bb2",
+        "x-secsdk-web-expire": "1791795817",
+    }
+
+
+def test_probe_generates_fresh_web_signature_for_each_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = iter([1791795817, 1791795818])
+    monkeypatch.setattr(douyin, "time", lambda: next(clock))
+    signatures: list[str] = []
+    timestamps: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(parse_qsl(request.url.query.decode(), keep_blank_values=True))
+        if not params.get("x-secsdk-web-signature") or not params.get("timestamp"):
+            return httpx.Response(403, text="Blocked by ArgusSecurityPlugin Signature Not Found")
+        assert params["uifid"] == request.headers["uifid"] == "browser-id"
+        assert params["x-secsdk-web-signature"] == request.headers["x-secsdk-web-signature"]
+        assert params["timestamp"] == request.headers["x-secsdk-web-expire"]
+        signatures.append(params["x-secsdk-web-signature"])
+        timestamps.append(params["timestamp"])
+        return httpx.Response(200, json=_detail_payload())
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        downloader = DouyinDownloader(client=client, cookie_header="sessionid=test; UIFID=browser-id")
+        for _ in range(2):
+            assert downloader.probe("https://www.douyin.com/video/6961737553342991651").title == "测试抖音作品"
+    assert timestamps == ["1791795817", "1791795818"]
+    assert signatures[0] != signatures[1]
 
 
 @pytest.mark.parametrize("reason, expected", [
