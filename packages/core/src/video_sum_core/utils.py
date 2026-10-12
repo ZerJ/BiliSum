@@ -46,6 +46,26 @@ def normalize_video_url(value: str) -> NormalizedVideoUrl:
             platform="youtube",
         )
 
+    douyin_match = re.search(
+        r"https?://(?:[a-z0-9-]+\.)*(?:douyin\.com|iesdouyin\.com)(?::\d+)?/[^\s<>\"']*",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if douyin_match:
+        douyin_url = douyin_match.group(0).rstrip(".,;:!?)]}>，。；：！？）】》")
+        item_match = re.search(
+            r"/(?:share/)?(?:video|note)/(\d{15,22})(?:[/?#]|$)",
+            douyin_url,
+            flags=re.IGNORECASE,
+        )
+        item_id = item_match.group(1) if item_match else ""
+        normalized_url = f"https://www.douyin.com/video/{item_id}" if item_id else douyin_url
+        return NormalizedVideoUrl(
+            normalized_url=normalized_url,
+            canonical_id=item_id,
+            platform="douyin",
+        )
+
     return NormalizedVideoUrl(normalized_url=raw, canonical_id="")
 
 

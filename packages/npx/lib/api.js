@@ -4,7 +4,7 @@
  * Minimal HTTP client for the BiliSum service API.
  *
  * Zero-dependency: uses Node's global fetch (Node >= 18). All requests are
- * authenticated with a Bearer token when one is available.
+ * authenticated with a Bearer token before account setup, or a login cookie.
  */
 
 const { createReadStream } = require("node:fs");
@@ -47,7 +47,9 @@ async function apiRequest(baseUrl, path, {
 } = {}) {
   const url = `${baseUrl}${path}`;
   const requestHeaders = { ...headers };
-  if (token) {
+  if (token && typeof token === "object" && token.sessionCookie) {
+    requestHeaders.Cookie = token.sessionCookie;
+  } else if (token) {
     requestHeaders.Authorization = `Bearer ${token}`;
   }
   if (json !== undefined) {
@@ -98,6 +100,22 @@ function baseUrlFor(host, port) {
 
 function health(baseUrl, { timeoutMs = 3000 } = {}) {
   return apiRequest(baseUrl, "/health", { timeoutMs });
+}
+
+async function loginAccount(baseUrl, name, password) {
+  const response = await fetch(`${baseUrl}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, password }),
+  });
+  if (!response.ok) {
+    throw new ApiError("账户登录失败", response.status, extractDetail(await response.json()));
+  }
+  const cookie = response.headers.get("set-cookie")?.match(/(?:^|,\s*)(bilisum_account=[^;\s]+)/)?.[1];
+  if (!cookie) {
+    throw new ApiError("服务端未返回账户会话", 0, "");
+  }
+  return { sessionCookie: cookie };
 }
 
 function probeVideo(baseUrl, token, url, { forceRefresh = false, timeoutMs = 120_000 } = {}) {
@@ -175,6 +193,7 @@ module.exports = {
   apiRequest,
   baseUrlFor,
   health,
+  loginAccount,
   probeVideo,
   uploadLocalMedia,
   createVideoTask,

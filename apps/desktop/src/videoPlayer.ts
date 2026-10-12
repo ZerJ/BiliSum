@@ -7,6 +7,37 @@ export type PlayerEmbedDescriptor = {
   openLabel: string;
 };
 
+const LOCAL_VIDEO_SUFFIXES = new Set([".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".flv", ".m4v", ".ts", ".mpeg", ".mpg"]);
+
+export function buildCachedVideoMediaUrl(
+  videoId: string,
+  platform?: string | null,
+  sourceUrl?: string | null,
+  revision?: string | null,
+) {
+  const normalizedPlatform = String(platform || "").toLowerCase();
+  if (!videoId || !["local", "douyin"].includes(normalizedPlatform)) {
+    return null;
+  }
+
+  if (normalizedPlatform === "local") {
+    let path = String(sourceUrl || "");
+    try {
+      path = new URL(path, "http://localhost").pathname;
+    } catch {
+      // Fall back to the original local path.
+    }
+    const normalizedPath = path.replaceAll("\\", "/").split(/[?#]/, 1)[0].toLowerCase();
+    const suffix = normalizedPath.includes(".") ? `.${normalizedPath.split(".").pop()}` : "";
+    if (!LOCAL_VIDEO_SUFFIXES.has(suffix)) {
+      return null;
+    }
+  }
+
+  const query = revision ? `?status=${encodeURIComponent(revision)}` : "";
+  return `/api/v1/videos/${encodeURIComponent(videoId)}/media${query}`;
+}
+
 export function buildBilibiliEmbedUrl(sourceUrl?: string | null) {
   if (!sourceUrl) {
     return null;

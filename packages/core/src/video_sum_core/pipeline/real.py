@@ -46,6 +46,7 @@ from video_sum_infra.runtime import (
     sanitized_subprocess_dll_search,
 )
 
+from video_sum_core.douyin import DouyinDownloader
 from video_sum_core.errors import (
     LLMAuthenticationError,
     LLMConfigurationError,
@@ -455,8 +456,8 @@ class RealPipelineRunner(PipelineRunner):
         normalized = normalize_video_url(task_input.source)
         normalized_url = normalized.normalized_url
         canonical_id = normalized.canonical_id
-        if normalized.platform not in {"bilibili", "youtube"}:
-            raise UnsupportedInputError("Current runner only supports Bilibili and YouTube video URLs.")
+        if normalized.platform not in {"bilibili", "youtube", "douyin"}:
+            raise UnsupportedInputError("Current runner only supports Bilibili, YouTube, and Douyin video URLs.")
 
         task_dir = ensure_directory(self._settings.tasks_dir / context.task_id)
         emit("probing", 12, "正在读取视频信息", {"url": normalized_url})
@@ -823,6 +824,9 @@ class RealPipelineRunner(PipelineRunner):
         raise VideoSumError(f"Failed to read or download video with yt-dlp: {message}") from error
 
     def _probe_video(self, url: str) -> dict:
+        if normalize_video_url(url).platform == "douyin":
+            with self._douyin_downloader() as downloader:
+                return downloader.probe(url).as_probe_dict()
         YoutubeDL, DownloadError = _get_ytdlp_classes()
         try:
             with YoutubeDL(self._base_ydl_options()) as ydl:
@@ -840,6 +844,31 @@ class RealPipelineRunner(PipelineRunner):
         safe_title: str,
         emit: Callable[[str, int, str, dict[str, object] | None], None],
     ) -> Path:
+        if normalize_video_url(url).platform == "douyin":
+            emit("downloading", 20, "正在连接抖音视频源")
+            video_path = task_dir / "source.douyin.mp4"
+
+            def douyin_progress(downloaded: int, total: int | None) -> None:
+                if total:
+                    ratio = max(0.0, min(1.0, downloaded / total))
+                    emit(
+                        "downloading",
+                        min(42, 22 + int(ratio * 20)),
+                        self._build_download_message(downloaded, total, None, None, None, None),
+                        {"downloaded_bytes": downloaded, "total_bytes": total},
+                    )
+
+            with self._douyin_downloader() as downloader:
+                downloader.download_video(url, video_path, progress=douyin_progress)
+            emit("downloading", 44, "抖音视频下载完成，正在提取音轨")
+            return self._prepare_local_audio_source(
+                video_path,
+                task_dir,
+                "source",
+                InputType.VIDEO_FILE,
+                emit,
+            )
+
         emit("downloading", 20, "正在连接音频源")
         output_template = str(task_dir / f"{safe_title}.%(ext)s")
         download_progress = {
@@ -1000,6 +1029,18 @@ class RealPipelineRunner(PipelineRunner):
         except Exception as exc:
             logger.warning("failed to extract bilibili cookie: %s", exc)
             return None
+
+    def _douyin_downloader(self) -> DouyinDownloader:
+        cookie_file = str(
+            self._settings.ytdlp_cookies_file
+            or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_FILE")
+            or os.environ.get("YTDLP_COOKIES_FILE")
+            or ""
+        ).strip()
+        return DouyinDownloader(
+            cookie_file=cookie_file or None,
+            ffmpeg_path=ffmpeg_location(),
+        )
 
     def _build_download_message(
         self,
@@ -3618,7 +3659,16 @@ P 数索引：
         )
         enhanced_note_path.write_text(enhanced_note_markdown, encoding="utf-8")
         self._write_json_atomic(insert_plan_path, insert_plan)
-        status = "ready" if enhanced_note_markdown.strip() and insert_plan.get("insertions") else "partial" if frames else "failed"
+        actual_insert_count = len(
+            re.findall(r"!\[[^\]]*\]\(visual://[^)]+\)", enhanced_note_markdown)
+        )
+        status = (
+            "ready"
+            if enhanced_note_markdown.strip() and actual_insert_count
+            else "partial"
+            if frames
+            else "failed"
+        )
         context = self._build_visual_context_payload(
             task_id=task_id,
             status=status,
@@ -3632,7 +3682,7 @@ P 数索引：
             keyframe_plan_path=keyframe_plan_path,
             insert_plan_path=insert_plan_path,
             mode=mode,
-            insert_count=len(insert_plan.get("insertions", [])) if isinstance(insert_plan.get("insertions"), list) else 0,
+            insert_count=actual_insert_count,
             llm_usage_breakdown=usage_breakdown,
         )
         self._write_json_atomic(context_path, context)
@@ -3984,6 +4034,14 @@ P 数索引：
 
     def _download_video_for_visuals(self, url: str, output_dir: Path, safe_title: str) -> Path:
         ensure_directory(output_dir)
+        if normalize_video_url(url).platform == "douyin":
+            target = output_dir / "source.visual.mp4"
+            with self._douyin_downloader() as downloader:
+                return downloader.download_video(
+                    url,
+                    target,
+                    max_height=self._visual_download_height(),
+                )
         output_template = str(output_dir / f"{safe_title}.visual.%(ext)s")
         height = self._visual_download_height()
         options = {
@@ -4586,24 +4644,99 @@ P 数索引：
         if not insertions:
             return knowledge_note_markdown
         lines = knowledge_note_markdown.splitlines()
+        if not lines:
+            return knowledge_note_markdown
+
+        heading_indices = [index for index, line in enumerate(lines) if line.strip().startswith("#")]
+        placements: dict[int, list[dict[str, object]]] = {}
+        placed_ids: set[int] = set()
+
+        def place(line_index: int, insertion: dict[str, object]) -> None:
+            placements.setdefault(line_index, []).append(insertion)
+            placed_ids.add(id(insertion))
+
+        # Prefer semantic heading matches, but evaluate every insertion independently so
+        # one bad planner anchor cannot block all later images.
+        for insertion in insertions:
+            anchors = [
+                str(insertion.get(key) or "").strip()
+                for key in ("anchor_heading", "chapter_title")
+                if str(insertion.get(key) or "").strip()
+            ]
+            for heading_index in heading_indices:
+                heading_text = re.sub(r"^#+\s*", "", lines[heading_index].strip()).strip()
+                if not heading_text:
+                    continue
+                if any(self._visual_heading_matches(anchor, heading_text) for anchor in anchors):
+                    place(heading_index, insertion)
+                    break
+
+        unmatched = [item for item in insertions if id(item) not in placed_ids]
+        timeline_sections = self._visual_timeline_sections(lines, heading_indices)
+        if timeline_sections:
+            for insertion in unmatched:
+                try:
+                    timestamp_seconds = float(insertion.get("timestamp_seconds") or 0)
+                except (TypeError, ValueError):
+                    timestamp_seconds = 0.0
+                _section_time, section_end = min(
+                    timeline_sections,
+                    key=lambda section: abs(section[0] - timestamp_seconds),
+                )
+                place(section_end, insertion)
+
+        unmatched = [item for item in insertions if id(item) not in placed_ids]
+        if unmatched:
+            section_ends = self._visual_fallback_section_ends(lines, heading_indices)
+            for index, insertion in enumerate(unmatched):
+                target = section_ends[min(index, len(section_ends) - 1)] if section_ends else len(lines) - 1
+                place(target, insertion)
+
         output: list[str] = []
-        insertion_index = 0
-        for line in lines:
-            stripped = line.strip()
-            is_heading = stripped.startswith("#")
+        for line_index, line in enumerate(lines):
             output.append(line)
-            if insertion_index >= len(insertions):
-                continue
-            current = insertions[insertion_index]
-            anchor = str(current.get("anchor_heading") or current.get("chapter_title") or "").strip()
-            if not is_heading or not anchor:
-                continue
-            heading_text = re.sub(r"^#+\s*", "", stripped).strip()
-            shorter, longer = sorted((len(anchor), len(heading_text)))
-            if (anchor in heading_text or heading_text in anchor) and shorter >= longer * 0.6:
-                output.extend(self._format_visual_insertion_markdown(current))
-                insertion_index += 1
+            for insertion in placements.get(line_index, []):
+                output.extend(self._format_visual_insertion_markdown(insertion))
         return "\n".join(output).strip()
+
+    def _visual_heading_matches(self, anchor: str, heading: str) -> bool:
+        if not anchor or not heading:
+            return False
+        shorter, longer = sorted((len(anchor), len(heading)))
+        return (anchor in heading or heading in anchor) and shorter >= longer * 0.6
+
+    def _visual_timeline_sections(
+        self,
+        lines: list[str],
+        heading_indices: list[int],
+    ) -> list[tuple[float, int]]:
+        sections: list[tuple[float, int]] = []
+        timestamp_pattern = re.compile(r"(?<!\d)(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?!\d)")
+        for line_index, line in enumerate(lines):
+            match = timestamp_pattern.search(line)
+            if not match:
+                continue
+            hours = int(match.group(1) or 0)
+            minutes = int(match.group(2))
+            seconds = int(match.group(3))
+            next_heading = next((index for index in heading_indices if index > line_index), len(lines))
+            section_end = max(line_index, next_heading - 1)
+            sections.append((float(hours * 3600 + minutes * 60 + seconds), section_end))
+        return sections
+
+    def _visual_fallback_section_ends(self, lines: list[str], heading_indices: list[int]) -> list[int]:
+        content_headings = [
+            index
+            for index in heading_indices
+            if len(lines[index]) - len(lines[index].lstrip("#")) >= 2
+        ]
+        candidates = content_headings or heading_indices
+        if not candidates:
+            return []
+        return [
+            max(heading_index, next_heading - 1)
+            for heading_index, next_heading in zip(candidates, [*candidates[1:], len(lines)])
+        ]
 
     def _format_visual_insertion_markdown(self, insertion: dict[str, object]) -> list[str]:
         image = str(insertion.get("markdown_image") or "").strip()

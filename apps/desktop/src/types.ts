@@ -271,6 +271,7 @@ export type VideoTaskBatchRequest = {
   page_numbers: number[];
   confirm?: boolean;
   prompt_preset_id?: string | null;
+  visual_note_mode?: string | null;
 };
 
 export type VideoTaskBatchResponse = {
@@ -443,8 +444,10 @@ export type RuntimeStatus = {
 };
 
 export type AuthStatus = {
-  required: boolean;
-  authenticated: boolean;
+    required: boolean;
+    authenticated: boolean;
+    setupRequired?: boolean;
+    account?: KnowledgeUser | null;
   configuredFromEnv?: boolean;
   tokenFile?: string;
 };
@@ -728,6 +731,16 @@ export type KnowledgeTagRecord = {
   created_at: string;
 };
 
+export type KnowledgeUser = {
+    user_id: string;
+    name: string;
+    is_default: boolean;
+    is_admin: boolean;
+    has_login: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
 export type KnowledgeTagItem = {
   tag: string;
   count: number;
@@ -781,7 +794,10 @@ export type KnowledgeSearchRequest = {
 };
 
 export type KnowledgeSearchResult = {
-  video_id: string;
+  video_id?: string | null;
+  source_kind?: "video" | "article";
+  source_id?: string;
+  source_url?: string;
   title: string;
   relevance_score: number;
   snippet: string;
@@ -800,7 +816,10 @@ export type KnowledgeSearchResponse = {
 };
 
 export type KnowledgeSourceRef = {
-  video_id: string;
+  video_id?: string | null;
+  source_kind?: "video" | "article";
+  source_id?: string;
+  source_url?: string;
   title: string;
   relevance_score: number;
   timestamp?: string | null;
@@ -897,10 +916,49 @@ export type KnowledgeToolTrace = {
 
 export type KnowledgeStatsResponse = {
   video_count: number;
+  document_count: number;
   indexed_chunk_count: number;
   tag_count: number;
   untagged_video_count: number;
   knowledge_llm_available: boolean;
+};
+
+export type KnowledgeDocument = {
+  document_id: string;
+  source_url: string;
+  canonical_url: string;
+  source_type: "article" | "wechat_article" | string;
+  title: string;
+  author: string;
+  published_at?: string | null;
+  cover_url: string;
+  content_markdown: string;
+  plain_text: string;
+  summary_markdown: string;
+  image_count: number;
+  analyzed_image_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type KnowledgeDocumentSummary = Pick<
+  KnowledgeDocument,
+  | "document_id"
+  | "source_url"
+  | "source_type"
+  | "title"
+  | "author"
+  | "published_at"
+  | "cover_url"
+  | "image_count"
+  | "analyzed_image_count"
+  | "updated_at"
+>;
+
+export type KnowledgeArticleImportResponse = {
+  document: KnowledgeDocument;
+  indexed_chunks: number;
+  cached: boolean;
 };
 
 export type KnowledgeAutoTagVideoResult = {
@@ -910,4 +968,12 @@ export type KnowledgeAutoTagVideoResult = {
 
 export type KnowledgeAutoTagResponse = {
   items: KnowledgeAutoTagVideoResult[];
+};
+export type KnowledgeContentItem = {
+  id: string;
+  kind: "video" | "article";
+  title: string;
+  cover_url: string | null;
+  category: string;
+  included: boolean;
 };

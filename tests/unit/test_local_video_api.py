@@ -12,7 +12,28 @@ from video_sum_service.routers.videos import (
     create_video_task,
     create_video_tasks_batch,
 )
-from video_sum_service.schemas import VideoAssetRecord
+from video_sum_service.schemas import VideoAssetRecord, VideoTaskBatchRequest
+
+
+@pytest.mark.parametrize("mode", ["text", "frame_insert"])
+def test_batch_preserves_conversation_note_format(mode: str) -> None:
+    repository = create_repository()
+    worker = FakeTaskWorker()
+    asset = repository.upsert_video_asset(VideoAssetRecord(
+        canonical_id="BV-chat-format", platform="bilibili", title="对话格式",
+        source_url="https://www.bilibili.com/video/BV-chat-format",
+        pages=[make_page("BV-chat-format", 1, "P1"), make_page("BV-chat-format", 2, "P2")],
+    ))
+    app.state.task_repository = repository
+    app.state.task_worker = worker
+    response = create_video_tasks_batch(
+        asset.video_id,
+        VideoTaskBatchRequest(page_numbers=[1, 2], visual_note_mode=mode),
+        type("Request", (), {"app": app})(),
+    )
+    assert len(response.created_tasks) == 2
+    for task in response.created_tasks:
+        assert repository.get_task(task.task_id).task_input.options.visual_note_mode == mode
 
 
 class FakeTaskWorker:

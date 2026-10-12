@@ -36,7 +36,7 @@ export function MarkdownContent({ className = "", compact = false, content, imag
         }}
         components={{
           img({ src = "", alt = "" }) {
-            return <img src={String(src)} alt={String(alt || "")} loading="lazy" />;
+            return <img src={String(src)} alt={String(alt || "")} loading="lazy" referrerPolicy="no-referrer" />;
           },
         }}
       >

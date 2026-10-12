@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlencode, urlparse
 from fastapi import HTTPException
 
 from video_sum_core.models.tasks import InputType
+from video_sum_core.douyin import DouyinDownloader, DouyinError
 from video_sum_core.utils import extract_bilibili_page, normalize_video_url
 from video_sum_infra.runtime import ffmpeg_location
 
@@ -629,8 +630,39 @@ def probe_video_asset(
     canonical_id = normalized.canonical_id
     platform = normalized.platform
 
-    if platform not in {"bilibili", "youtube"}:
-        raise HTTPException(status_code=400, detail="当前仅支持 Bilibili 或 YouTube 单条视频链接。")
+    if platform not in {"bilibili", "youtube", "douyin"}:
+        raise HTTPException(status_code=400, detail="当前仅支持 Bilibili、YouTube 或抖音单条视频链接。")
+
+    if platform == "douyin":
+        cookie_file = str(
+            settings_manager.current.ytdlp_cookies_file
+            or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_FILE")
+            or os.environ.get("YTDLP_COOKIES_FILE")
+            or ""
+        ).strip()
+        try:
+            with DouyinDownloader(cookie_file=cookie_file or None) as downloader:
+                metadata = downloader.probe(normalized_url)
+        except DouyinError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        cached_cover_url = cache_cover_image(
+            metadata.cover_url,
+            metadata.aweme_id,
+            referer_url=metadata.source_url,
+        )
+        return (
+            build_base_video_asset(
+                canonical_id=metadata.aweme_id,
+                platform="douyin",
+                title=metadata.title,
+                source_url=metadata.source_url,
+                cover_url=cached_cover_url,
+                duration=metadata.duration,
+                pages=[],
+            ),
+            [],
+            False,
+        )
 
     if platform == "youtube":
         info = extract_video_info(normalized_url)

@@ -23,10 +23,11 @@ from video_sum_service.integrations import extract_http_error_detail, extract_ll
 
 logger = logging.getLogger(__name__)
 
-KNOWLEDGE_LLM_TIMEOUT = httpx.Timeout(connect=15.0, read=45.0, write=30.0, pool=30.0)
+KNOWLEDGE_LLM_TIMEOUT = httpx.Timeout(connect=30.0, read=45.0, write=30.0, pool=30.0)
 KNOWLEDGE_LLM_STREAM_TIMEOUT = httpx.Timeout(connect=15.0, read=12.0, write=30.0, pool=30.0)
 KNOWLEDGE_LLM_FIRST_CONTENT_TIMEOUT_SECONDS = 18.0
 KNOWLEDGE_LLM_MAX_REASONING_PREVIEW_CHARS = 4000
+KNOWLEDGE_LLM_CONNECT_RETRY_COUNT = 1
 
 
 @dataclass(frozen=True)
@@ -133,20 +134,65 @@ def chat_knowledge_llm(
 
     started_at = time.monotonic()
     logger.info("knowledge llm request start mode=chat base_url=%s model=%s max_tokens=%s", base_url, model, max_tokens)
-    try:
-        with httpx.Client(timeout=KNOWLEDGE_LLM_TIMEOUT, follow_redirects=True) as client:
-            response = client.post(request_url, headers=headers, json=request_payload)
-    except httpx.ReadTimeout as exc:
-        elapsed_ms = int((time.monotonic() - started_at) * 1000)
-        logger.warning("knowledge llm request timeout mode=chat model=%s elapsed_ms=%s", model, elapsed_ms)
-        raise HTTPException(
-            status_code=504,
-            detail="知识库 LLM 响应超时：模型返回过慢，请稍后重试，或换更快的模型 / 减少上下文。",
-        ) from exc
-    except httpx.HTTPError as exc:
-        elapsed_ms = int((time.monotonic() - started_at) * 1000)
-        logger.warning("knowledge llm request failed mode=chat model=%s elapsed_ms=%s error=%s", model, elapsed_ms, exc)
-        raise HTTPException(status_code=502, detail=f"知识库 LLM 连接失败：{exc}") from exc
+    for attempt in range(KNOWLEDGE_LLM_CONNECT_RETRY_COUNT + 1):
+        try:
+            with httpx.Client(timeout=KNOWLEDGE_LLM_TIMEOUT, follow_redirects=True) as client:
+                response = client.post(request_url, headers=headers, json=request_payload)
+            break
+        except httpx.ConnectTimeout as exc:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            if attempt < KNOWLEDGE_LLM_CONNECT_RETRY_COUNT:
+                logger.warning(
+                    "knowledge llm connect timeout, retrying mode=chat model=%s "
+                    "elapsed_ms=%s attempt=%s/%s",
+                    model,
+                    elapsed_ms,
+                    attempt + 1,
+                    KNOWLEDGE_LLM_CONNECT_RETRY_COUNT,
+                )
+                continue
+            logger.warning(
+                "knowledge llm connect timeout mode=chat model=%s elapsed_ms=%s attempts=%s",
+                model,
+                elapsed_ms,
+                attempt + 1,
+            )
+            raise HTTPException(
+                status_code=504,
+                detail="知识库 LLM 连接超时：模型服务当前繁忙或网络不可达，请稍后重试。",
+            ) from exc
+        except httpx.ReadTimeout as exc:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            logger.warning(
+                "knowledge llm request timeout mode=chat model=%s elapsed_ms=%s",
+                model,
+                elapsed_ms,
+            )
+            raise HTTPException(
+                status_code=504,
+                detail="知识库 LLM 响应超时：模型返回过慢，请稍后重试，或换更快的模型 / 减少上下文。",
+            ) from exc
+        except httpx.TimeoutException as exc:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            logger.warning(
+                "knowledge llm transport timeout mode=chat model=%s elapsed_ms=%s error=%s",
+                model,
+                elapsed_ms,
+                exc,
+            )
+            raise HTTPException(
+                status_code=504,
+                detail="知识库 LLM 请求超时：模型服务当前繁忙，请稍后重试。",
+            ) from exc
+        except httpx.HTTPError as exc:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            logger.warning(
+                "knowledge llm request failed mode=chat model=%s elapsed_ms=%s error=%s",
+                model,
+                elapsed_ms,
+                exc,
+            )
+            raise HTTPException(status_code=502, detail=f"知识库 LLM 连接失败：{exc}") from exc
 
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     logger.info(

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { buildPlayerEmbedDescriptor, buildYouTubeEmbedUrl, withPlayerSeek } from "../src/videoPlayer.ts";
+import { buildCachedVideoMediaUrl, buildPlayerEmbedDescriptor, buildYouTubeEmbedUrl, withPlayerSeek } from "../src/videoPlayer.ts";
 
 function run(name: string, fn: () => void) {
   fn();
@@ -35,4 +35,22 @@ run("returns descriptor labels for supported player platforms", () => {
   assert.equal(bilibili?.openLabel, "在 Bilibili 打开");
   assert.equal(youtube?.platform, "youtube");
   assert.equal(youtube?.openLabel, "在 YouTube 打开");
+});
+
+run("builds seekable cached media urls for douyin and local videos", () => {
+  assert.equal(
+    buildCachedVideoMediaUrl(
+      "douyin-video",
+      "douyin",
+      "https://www.douyin.com/video/6961737553342991651",
+      "completed",
+    ),
+    "/api/v1/videos/douyin-video/media?status=completed",
+  );
+  assert.equal(
+    buildCachedVideoMediaUrl("local-video", "local", "C:\\Videos\\demo.mp4", "running"),
+    "/api/v1/videos/local-video/media?status=running",
+  );
+  assert.equal(buildCachedVideoMediaUrl("youtube-video", "youtube", "https://youtu.be/example"), null);
+  assert.equal(buildCachedVideoMediaUrl("audio", "local", "C:\\Audio\\demo.mp3"), null);
 });

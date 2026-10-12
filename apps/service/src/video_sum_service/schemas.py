@@ -27,6 +27,7 @@ class VideoTaskBatchRequest(BaseModel):
     page_numbers: list[int] = Field(default_factory=list)
     confirm: bool = False
     prompt_preset_id: str | None = None
+    visual_note_mode: str | None = None
 
 
 class AggregateSummaryRequest(BaseModel):
@@ -557,6 +558,109 @@ class KnowledgeIndexChunkRecord(BaseModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class KnowledgeContentItem(BaseModel):
+    id: str
+    kind: Literal["video", "article"]
+    title: str
+    cover_url: str | None = None
+    category: str = ""
+    included: bool = True
+
+
+class KnowledgeUserRecord(BaseModel):
+    user_id: str
+    name: str
+    is_default: bool = False
+    is_admin: bool = False
+    has_login: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+
+class KnowledgeUserCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    password: str | None = Field(default=None, min_length=8, max_length=256)
+
+
+class KnowledgeUserUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+
+
+class KnowledgeUserCredentialsRequest(BaseModel):
+    password: str = Field(min_length=8, max_length=256)
+
+
+class KnowledgeContentTarget(BaseModel):
+    id: str = Field(min_length=1)
+    kind: Literal["video", "article"]
+
+
+class KnowledgeClassifyRequest(BaseModel):
+    items: list[KnowledgeContentTarget] = Field(min_length=1, max_length=500)
+    category: str = Field(default="", max_length=80)
+
+
+class KnowledgeContentMembershipRequest(BaseModel):
+    items: list[KnowledgeContentTarget] = Field(min_length=1, max_length=500)
+    included: bool
+
+
+class KnowledgeDocumentRecord(BaseModel):
+    document_id: str = Field(default_factory=lambda: uuid4().hex)
+    source_url: str
+    canonical_url: str
+    source_type: str = "article"
+    title: str
+    author: str = ""
+    published_at: datetime | None = None
+    cover_url: str = ""
+    content_markdown: str
+    plain_text: str
+    summary_markdown: str = ""
+    image_count: int = 0
+    analyzed_image_count: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class KnowledgeDocumentSummary(BaseModel):
+    document_id: str
+    source_url: str
+    source_type: str = "article"
+    title: str
+    author: str = ""
+    published_at: datetime | None = None
+    cover_url: str = ""
+    image_count: int = 0
+    analyzed_image_count: int = 0
+    updated_at: datetime
+
+
+class KnowledgeDocumentChunkRecord(BaseModel):
+    chunk_id: str
+    document_id: str
+    embedding_json: str
+    indexed_content: str
+    index_type: str = "article_section"
+    segment_order: int | None = None
+    anchor_label: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class KnowledgeArticleImportRequest(BaseModel):
+    url: str
+    analyze_images: bool = True
+    summarize: bool = True
+    force_refresh: bool = False
+
+
+class KnowledgeArticleImportResponse(BaseModel):
+    document: KnowledgeDocumentRecord
+    indexed_chunks: int
+    cached: bool = False
+
+
 class TagItem(BaseModel):
     tag: str
     count: int
@@ -628,7 +732,10 @@ class KnowledgeSearchRequest(BaseModel):
 
 
 class KnowledgeSearchResult(BaseModel):
-    video_id: str
+    video_id: str | None = None
+    source_kind: Literal["video", "article"] = "video"
+    source_id: str = ""
+    source_url: str = ""
     title: str
     relevance_score: float
     snippet: str
@@ -759,7 +866,10 @@ class KnowledgeReferencesResponse(BaseModel):
 
 
 class KnowledgeSourceRef(BaseModel):
-    video_id: str
+    video_id: str | None = None
+    source_kind: Literal["video", "article"] = "video"
+    source_id: str = ""
+    source_url: str = ""
     title: str
     relevance_score: float
     timestamp: str | None = None
@@ -779,6 +889,7 @@ class KnowledgeAskResponse(BaseModel):
 
 class KnowledgeStatsResponse(BaseModel):
     video_count: int
+    document_count: int = 0
     indexed_chunk_count: int
     tag_count: int
     untagged_video_count: int
@@ -787,3 +898,4 @@ class KnowledgeStatsResponse(BaseModel):
 
 class KnowledgeRebuildResponse(BaseModel):
     indexed_videos: int
+    indexed_documents: int = 0

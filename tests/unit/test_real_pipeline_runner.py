@@ -629,7 +629,7 @@ def test_run_from_local_video_file_uses_local_media_pipeline(monkeypatch: pytest
 def test_run_from_url_rejects_unsupported_url(tmp_path: Path) -> None:
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
 
-    with pytest.raises(UnsupportedInputError, match="supports Bilibili and YouTube"):
+    with pytest.raises(UnsupportedInputError, match="supports Bilibili, YouTube, and Douyin"):
         runner.run(
             PipelineContext(
                 task_id="task-unsupported",
@@ -667,6 +667,120 @@ def test_probe_video_uses_cookies_file_and_browser_headers(monkeypatch: pytest.M
     assert captured_options["cookiefile"] == str(cookie_file)
     assert "Mozilla/5.0" in captured_options["http_headers"]["User-Agent"]
     assert captured_options["http_headers"]["Referer"] == "https://www.bilibili.com/"
+
+
+def test_probe_douyin_bypasses_ytdlp(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
+
+    class Metadata:
+        def as_probe_dict(self) -> dict[str, object]:
+            return {"id": "6961737553342991651", "title": "抖音测试", "duration": 12.0}
+
+    class FakeDownloader:
+        def __enter__(self) -> "FakeDownloader":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def probe(self, url: str) -> Metadata:
+            assert "douyin.com/video/6961737553342991651" in url
+            return Metadata()
+
+    monkeypatch.setattr(runner, "_douyin_downloader", lambda: FakeDownloader())
+    monkeypatch.setattr(
+        "video_sum_core.pipeline.real._get_ytdlp_classes",
+        lambda: (_ for _ in ()).throw(AssertionError("Douyin must not use yt-dlp")),
+    )
+
+    info = runner._probe_video("https://www.douyin.com/video/6961737553342991651")
+
+    assert info["title"] == "抖音测试"
+
+
+def test_douyin_audio_download_uses_short_internal_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
+    captured: dict[str, object] = {}
+
+    class FakeDownloader:
+        def __enter__(self) -> "FakeDownloader":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def download_video(
+            self,
+            url: str,
+            target: Path,
+            *,
+            progress: object,
+        ) -> Path:
+            captured["video_path"] = target
+            return target
+
+    def prepare_audio(
+        source_path: Path,
+        task_dir: Path,
+        safe_title: str,
+        input_type: InputType,
+        emit: object,
+    ) -> Path:
+        captured["audio_title"] = safe_title
+        captured["input_type"] = input_type
+        return task_dir / f"{safe_title}.mp3"
+
+    monkeypatch.setattr(runner, "_douyin_downloader", lambda: FakeDownloader())
+    monkeypatch.setattr(runner, "_prepare_local_audio_source", prepare_audio)
+
+    result = runner._download_audio(
+        "https://www.douyin.com/video/6961737553342991651",
+        tmp_path,
+        "长" * 120,
+        lambda *_args: None,
+    )
+
+    assert captured["video_path"] == tmp_path / "source.douyin.mp4"
+    assert captured["audio_title"] == "source"
+    assert captured["input_type"] is InputType.VIDEO_FILE
+    assert result == tmp_path / "source.mp3"
+
+
+def test_visual_douyin_download_bypasses_ytdlp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path, visual_download_resolution="720p"))
+
+    class FakeDownloader:
+        def __enter__(self) -> "FakeDownloader":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def download_video(self, url: str, target: Path, *, max_height: int) -> Path:
+            assert max_height == 720
+            assert target == tmp_path / "visuals" / "source.visual.mp4"
+            target.write_bytes(b"video")
+            return target
+
+    monkeypatch.setattr(runner, "_douyin_downloader", lambda: FakeDownloader())
+    monkeypatch.setattr(
+        "video_sum_core.pipeline.real._get_ytdlp_classes",
+        lambda: (_ for _ in ()).throw(AssertionError("Douyin must not use yt-dlp")),
+    )
+
+    result = runner._download_video_for_visuals(
+        "https://www.douyin.com/video/6961737553342991651",
+        tmp_path / "visuals",
+        "长" * 120,
+    )
+
+    assert result.read_bytes() == b"video"
 
 
 def test_probe_video_maps_bilibili_412_to_actionable_error(
@@ -1308,6 +1422,119 @@ def test_visual_frame_insert_mode_composes_note_without_vlm(tmp_path: Path, monk
     assert "> 结合截图理解主题。" in markdown
     assert "## 图文笔记素材" not in markdown
     assert not describe_called
+
+
+def test_visual_frame_insert_mode_falls_back_to_timeline_markers_when_headings_do_not_match(
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(tasks_dir=tmp_path, visual_note_mode="frame_insert")
+    )
+    knowledge_note = """# 示例
+
+## 内容展开
+
+### 章节 1
+
+- 时间点：00:01
+
+第一章正文。
+
+### 章节 2
+
+- 时间点：00:47
+
+第二章正文。"""
+
+    markdown = runner._compose_visual_note_locally(
+        knowledge_note,
+        {
+            "insertions": [
+                {
+                    "frame_id": "f0001",
+                    "timestamp_seconds": 3.0,
+                    "anchor_heading": "无法匹配到笔记标题的长文本锚点一",
+                    "markdown_image": "visual://f0001",
+                    "alt": "第一章截图",
+                },
+                {
+                    "frame_id": "f0002",
+                    "timestamp_seconds": 54.0,
+                    "anchor_heading": "无法匹配到笔记标题的长文本锚点二",
+                    "markdown_image": "visual://f0002",
+                    "alt": "第二章截图",
+                },
+            ]
+        },
+    )
+
+    assert markdown.count("visual://") == 2
+    first_image_index = markdown.index("visual://f0001")
+    assert markdown.index("第一章正文。") < first_image_index < markdown.index("### 章节 2")
+    assert markdown.index("第二章正文。") < markdown.index("visual://f0002")
+
+
+def test_visual_evidence_is_not_ready_when_enhanced_note_has_no_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(tasks_dir=tmp_path, visual_note_mode="frame_insert")
+    )
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"video")
+
+    monkeypatch.setattr(
+        runner,
+        "_prepare_visual_source",
+        lambda task_input, task_dir, title: (source, "local_video", []),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_build_visual_keyframe_plan",
+        lambda title, result, mode: {
+            "schema_version": 1,
+            "mode": mode,
+            "keyframes": [{"timestamp_seconds": 3.0, "anchor_heading": "不存在的标题"}],
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_extract_visual_frames",
+        lambda source_path, timestamps, frames_dir: (
+            [
+                {
+                    "frame_id": "f0001",
+                    "timestamp_seconds": 3.0,
+                    "timestamp": "00:03",
+                    "file_name": "f0001.jpg",
+                    "image_path": "frames/f0001.jpg",
+                    "_absolute_path": str(frames_dir / "f0001.jpg"),
+                    "sha256": "abc",
+                }
+            ],
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_compose_visual_enhanced_note",
+        lambda **kwargs: "# 纯文本\n\n没有图片。",
+    )
+
+    context, _note_path, _context_path = runner.build_and_export_visual_evidence(
+        task_id="task-no-images",
+        task_input=TaskInput(input_type=InputType.VIDEO_FILE, source=str(source), title="视频"),
+        title="视频",
+        result=TaskResult(
+            knowledge_note_markdown="# 章节 1\n\n正文。",
+            timeline=[{"title": "不存在的标题", "start": 3.0}],
+        ),
+        mode="frame_insert",
+    )
+
+    assert context["status"] == "partial"
+    assert context["insert_count"] == 0
 
 
 def test_visual_evidence_force_rebuild_clears_previous_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

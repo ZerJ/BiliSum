@@ -7,6 +7,8 @@ const { existsSync } = require("node:fs");
 
 const {
   baseUrlFor,
+  apiRequest,
+  loginAccount,
   getTask,
   getTaskProgress,
   listTasks,
@@ -19,6 +21,7 @@ const { UsageError, parseTaskCommandArgs } = require("../lib/args");
 const { formatTasks, emit } = require("../lib/output");
 const { readVersion, locateBilisumDataRoot, findPython, cliHomeDir, ensureCliVenv, cliVenvPython, findSystemPython } = require("../lib/runtime");
 const { runSkillCommand } = require("../lib/skill");
+const { runChatCommand } = require("../lib/chat");
 const { readToken } = require("../lib/token");
 const {
   ensureService,
@@ -46,6 +49,8 @@ function printHelp() {
   console.log("AI 视频总结与知识库工具：CLI 直接控制已安装的 BiliSum（桌面端/服务）。");
   console.log("");
   console.log("Usage:");
+  console.log("  npx bilisum chat [url|file] [options]      对话选择内容和输出格式");
+  console.log("  npx bilisum <url>                         发送链接并进入对话");
   console.log("  npx bilisum summarize <url|file> [options]  Summarize a video (knowledge note)");
   console.log("  npx bilisum brief <url|file> [options]      Fast summary card only (skips note)");
   console.log("  npx bilisum transcribe <url|file> [options] Print the transcript of a video");
@@ -70,6 +75,7 @@ function printHelp() {
   console.log("  --port <port>                        Port, default 3838");
   console.log("  --data <path>                        Data root (default: env-dependent)");
   console.log("  --token <token>                      Access token (default: env-dependent)");
+  console.log("  BILISUM_USERNAME / BILISUM_PASSWORD  账户启用后的 CLI 登录凭据（环境变量）");
   console.log("  --environment <name>                 desktop | cli | custom | auto (one-shot)");
   console.log("  --env KEY=VALUE                      Extra env for a CLI-started service");
   console.log("");
@@ -200,6 +206,16 @@ async function ensureAuthenticatedService(options, log) {
   // inject it into a service the CLI spawns, so both always agree.
   let token = resolveServiceToken(options);
   await ensureService(options, { log, accessToken: token });
+  const baseUrl = baseUrlFor(options.host, options.port);
+  const status = await apiRequest(baseUrl, "/api/v1/auth/status");
+  if (status.setupRequired === false) {
+    const name = process.env.BILISUM_USERNAME || "";
+    const password = process.env.BILISUM_PASSWORD || "";
+    if (!name || !password) {
+      throw new UsageError("服务已启用多人账户。请设置 BILISUM_USERNAME 和 BILISUM_PASSWORD 后再运行命令。", { showHelp: false });
+    }
+    return loginAccount(baseUrl, name, password);
+  }
   if (!token) {
     // The CLI just spawned the service, which may have created {data}/auth.json.
     token = readToken(options);
@@ -507,7 +523,8 @@ async function settingsCommand(args) {
   // Pass the token in the URL fragment so the web UI can auto-authenticate
   // (the frontend consumes it and clears the fragment). The fragment is never
   // sent to the server.
-  const url = `http://${options.host}:${options.port}/settings#token=${encodeURIComponent(token)}`;
+  const baseUrl = `http://${options.host}:${options.port}/settings`;
+  const url = typeof token === "string" ? `${baseUrl}#token=${encodeURIComponent(token)}` : baseUrl;
   log(`打开设置页：${url}`);
   openUrl(url);
 }
@@ -603,6 +620,10 @@ async function main() {
     }
     if (command === "start" || command === "serve") {
       startService(args);
+      return;
+    }
+    if (command === "chat" || /^https?:\/\//i.test(command) || /^BV[a-zA-Z0-9]{10}$/.test(command)) {
+      await runChatCommand(command === "chat" ? args : [command, ...args], runTaskCommand);
       return;
     }
     if (command === "summarize" || command === "sum") {

@@ -122,6 +122,20 @@ def test_normalize_video_url_accepts_youtu_be_and_shorts() -> None:
     assert shorts_link.platform == "youtube"
 
 
+def test_normalize_video_url_accepts_douyin_video_and_share_text() -> None:
+    direct = normalize_video_url("https://www.douyin.com/video/6961737553342991651")
+    shared = normalize_video_url(
+        "3.21 复制打开抖音，看看【测试】 https://v.douyin.com/AbCdEfG/ 03/21"
+    )
+
+    assert direct.normalized_url == "https://www.douyin.com/video/6961737553342991651"
+    assert direct.canonical_id == "6961737553342991651"
+    assert direct.platform == "douyin"
+    assert shared.normalized_url == "https://v.douyin.com/AbCdEfG/"
+    assert shared.canonical_id == ""
+    assert shared.platform == "douyin"
+
+
 def test_probe_video_asset_requires_page_selection_for_multi_page(monkeypatch) -> None:
     payload = {
         "id": "BV1xx411c7mD",
@@ -493,6 +507,51 @@ def test_probe_video_asset_returns_youtube_single_video(monkeypatch) -> None:
     assert asset.source_url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert asset.title == "示例 YouTube 视频"
     assert pages == []
+
+
+def test_probe_video_asset_returns_douyin_single_video(monkeypatch) -> None:
+    class Metadata:
+        aweme_id = "6961737553342991651"
+        title = "测试抖音作品"
+        cover_url = "https://p3.douyinpic.com/cover.jpeg"
+        source_url = "https://www.douyin.com/video/6961737553342991651"
+        duration = 12.345
+
+    class FakeDownloader:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "FakeDownloader":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def probe(self, _url: str) -> Metadata:
+            return Metadata()
+
+    monkeypatch.setattr(service_app.video_assets, "DouyinDownloader", FakeDownloader)
+    monkeypatch.setattr(
+        service_app.video_assets,
+        "cache_cover_image",
+        lambda source_url, canonical_id, referer_url=None: source_url,
+    )
+    monkeypatch.setattr(
+        service_app.video_assets,
+        "extract_video_info",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Douyin must not use yt-dlp")),
+    )
+
+    asset, pages, requires_selection = service_app.probe_video_asset(
+        "https://www.douyin.com/video/6961737553342991651"
+    )
+
+    assert asset.platform == "douyin"
+    assert asset.canonical_id == "6961737553342991651"
+    assert asset.title == "测试抖音作品"
+    assert asset.duration == 12.345
+    assert pages == []
+    assert requires_selection is False
 
 
 def test_probe_video_asset_returns_local_video_from_file_path(monkeypatch, tmp_path) -> None:

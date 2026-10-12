@@ -14,7 +14,7 @@ import video_sum_service.routers.system as system_router
 
 
 @pytest.fixture(autouse=True)
-def restore_app_state():
+def restore_app_state(tmp_path: Path):
     original_repository = getattr(app.state, "task_repository", None)
     original_worker = getattr(app.state, "task_worker", None)
     original_runtime_startup = getattr(app.state, "runtime_startup", None)
@@ -24,6 +24,12 @@ def restore_app_state():
     original_settings = settings_manager.current
     original_app_manager = service_app.access_token_manager
     original_router_manager = system_router.access_token_manager
+    settings_manager._settings = ServiceSettings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        tasks_dir=tmp_path / "tasks",
+        database_url=f"sqlite:///{tmp_path / 'auth-tests.db'}",
+    )
     yield
     app.state.task_repository = original_repository
     app.state.task_worker = original_worker
@@ -95,6 +101,7 @@ def test_settings_do_not_echo_provider_api_keys(monkeypatch, tmp_path: Path) -> 
         data_dir=tmp_path / "data",
         cache_dir=tmp_path / "cache",
         tasks_dir=tmp_path / "tasks",
+        database_url=f"sqlite:///{tmp_path / 'auth-tests.db'}",
         siliconflow_asr_api_key="asr-secret",
         llm_api_key="llm-secret",
         knowledge_llm_api_key="knowledge-secret",

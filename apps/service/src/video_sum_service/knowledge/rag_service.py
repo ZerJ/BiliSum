@@ -16,7 +16,7 @@ from video_sum_service.knowledge.local_llm import (
     stream_knowledge_llm,
 )
 from video_sum_service.knowledge.tag_service import TagService
-from video_sum_service.repository import SqliteTaskRepository
+from video_sum_service.repository import DEFAULT_KNOWLEDGE_USER_ID, SqliteTaskRepository
 from video_sum_service.schemas import KnowledgeAskResponse, KnowledgeChatHistoryItem, KnowledgeReference, KnowledgeSourceRef
 
 
@@ -159,10 +159,12 @@ class KnowledgeAgent:
         repository: SqliteTaskRepository,
         index_service: KnowledgeIndexService,
         settings: ServiceSettings,
+        knowledge_user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
     ) -> None:
         self._repository = repository
         self._index_service = index_service
         self._settings = settings
+        self._knowledge_user_id = knowledge_user_id
         self._tool_handlers = {
             "conversation_context": self._prepare_context,
             "semantic_search": self._run_semantic_search,
@@ -268,12 +270,16 @@ class KnowledgeAgent:
         return None
 
     def _get_library_stats(self) -> dict[str, int]:
-        videos = self._repository.list_video_assets()
+        videos = self._repository.list_knowledge_video_assets(self._knowledge_user_id)
+        video_ids = {video.video_id for video in videos}
         return {
             "video_count": len(videos),
             "completed_summary_count": sum(1 for video in videos if video.latest_result is not None),
             "favorite_count": sum(1 for video in videos if video.is_favorite),
-            "folder_count": len(self._repository.list_video_folders()),
+            "folder_count": sum(
+                bool(video_ids & set(self._repository.list_video_ids_in_folder(folder.folder_id)))
+                for folder in self._repository.list_video_folders()
+            ),
         }
 
     def _list_recent_summaries(self) -> list[str]:
@@ -285,7 +291,13 @@ class KnowledgeAgent:
 
     def _recent_summary_videos(self):
         return sorted(
-            [video for video in self._repository.list_video_assets() if video.latest_result is not None and video.last_summary_at is not None],
+            [
+                video
+                for video in self._repository.list_knowledge_video_assets(
+                    self._knowledge_user_id
+                )
+                if video.latest_result is not None and video.last_summary_at is not None
+            ],
             key=lambda video: video.last_summary_at or video.updated_at,
             reverse=True,
         )[:8]
@@ -304,19 +316,39 @@ class KnowledgeAgent:
         return "\n".join(lines)
 
     def _list_favorites(self) -> list[str]:
-        return [f"- {video.title}" for video in self._repository.list_video_assets() if video.is_favorite][:20]
+        return [
+            f"- {video.title}"
+            for video in self._repository.list_knowledge_video_assets(
+                self._knowledge_user_id
+            )
+            if video.is_favorite
+        ][:20]
 
     def _list_folder_contents(self) -> list[str]:
-        return [
-            f"- {folder.name}：{len(self._repository.list_video_ids_in_folder(folder.folder_id))} 个视频"
-            for folder in self._repository.list_video_folders()[:20]
-        ]
+        allowed_video_ids = self._repository.list_knowledge_content_ids(
+            self._knowledge_user_id,
+            "video",
+        )
+        items = []
+        for folder in self._repository.list_video_folders()[:20]:
+            count = len(
+                allowed_video_ids
+                & set(self._repository.list_video_ids_in_folder(folder.folder_id))
+            )
+            if count:
+                items.append(f"- {folder.name}：{count} 个视频")
+        return items
 
     def _list_task_history(self) -> list[str]:
+        allowed_video_ids = self._repository.list_knowledge_content_ids(
+            self._knowledge_user_id,
+            "video",
+        )
         return [
             f"- {task.task_input.title or task.task_input.source}：{task.status.value}"
-            for task in self._repository.list_tasks()[:12]
-        ]
+            for task in self._repository.list_tasks()
+            if task.video_id in allowed_video_ids
+        ][:12]
 
     def _get_safe_settings(self) -> dict[str, object]:
         return {
@@ -373,10 +405,41 @@ class KnowledgeAgent:
 
         context_blocks: list[str] = []
         sources: list[KnowledgeSourceRef] = []
-        seen_sources: set[tuple[str, str | None]] = set()
+        seen_sources: set[tuple[str, str, str | None]] = set()
         for item in run.chunks:
-            video_id = str(item["video_id"])
+            source_kind = str(item.get("source_kind") or "video")
+            source_id = str(item.get("source_id") or item.get("video_id") or "")
             metadata = item["metadata"] if isinstance(item["metadata"], dict) else {}
+            if source_kind == "article":
+                document = self._repository.get_knowledge_document(
+                    source_id,
+                    self._knowledge_user_id,
+                )
+                title = document.title if document is not None else str(metadata.get("title") or "未知文章")
+                source_url = document.source_url if document is not None else str(metadata.get("source_url") or "")
+                context_blocks.append(
+                    "\n".join(
+                        [
+                            f"[文章：{title}]",
+                            f"[来源：{source_url}]" if source_url else "",
+                            str(item["document"]).strip(),
+                        ]
+                    ).strip()
+                )
+                key = (source_kind, source_id, None)
+                if key not in seen_sources:
+                    seen_sources.add(key)
+                    sources.append(
+                        KnowledgeSourceRef(
+                            source_kind="article",
+                            source_id=source_id,
+                            source_url=source_url,
+                            title=title,
+                            relevance_score=float(item["relevance_score"]),
+                        )
+                    )
+                continue
+            video_id = str(item["video_id"])
             asset = self._repository.get_video_asset(video_id)
             video_title = asset.title if asset is not None else str(metadata.get("title") or "未知视频")
             page_title = str(metadata.get("page_title") or metadata.get("display_title") or "").strip()
@@ -403,12 +466,15 @@ class KnowledgeAgent:
                     if line
                 )
             )
-            key = (video_id, timestamp)
+            key = ("video", video_id, timestamp)
             if key not in seen_sources:
                 seen_sources.add(key)
                 sources.append(
                     KnowledgeSourceRef(
                         video_id=video_id,
+                        source_kind="video",
+                        source_id=video_id,
+                        source_url=asset.source_url if asset is not None else str(metadata.get("source_url") or ""),
                         title=title,
                         relevance_score=float(item["relevance_score"]),
                         timestamp=timestamp,
@@ -435,7 +501,13 @@ class KnowledgeAgent:
             and not bool(getattr(self._settings, "knowledge_llm_enabled", False) or getattr(self._settings, "llm_enabled", False))
         ):
             if any(marker in run.plan.query for marker in ("最近在学", "学什么", "学习主题")):
-                videos = [video for video in self._repository.list_video_assets() if video.last_summary_at is not None]
+                videos = [
+                    video
+                    for video in self._repository.list_knowledge_video_assets(
+                        self._knowledge_user_id
+                    )
+                    if video.last_summary_at is not None
+                ]
                 videos = sorted(videos, key=lambda video: video.last_summary_at or video.updated_at, reverse=True)[:5]
                 if not videos:
                     return "目前还没有可用于判断学习主题的已完成总结。"
@@ -659,9 +731,14 @@ class KnowledgeAgent:
                 {"turn_count": len(run.plan.history)},
             )
         if tool_name == "semantic_search":
-            matched_videos = len({str(item["video_id"]) for item in run.chunks})
+            matched_sources = len(
+                {
+                    (str(item.get("source_kind") or "video"), str(item.get("source_id") or item.get("video_id") or ""))
+                    for item in run.chunks
+                }
+            )
             detail = (
-                f"命中 {len(run.chunks)} 个片段，来自 {matched_videos} 个视频。"
+                f"命中 {len(run.chunks)} 个片段，来自 {matched_sources} 个知识来源。"
                 if run.chunks
                 else "没有检索到相关知识片段。"
             )
@@ -670,7 +747,7 @@ class KnowledgeAgent:
                 "语义检索",
                 "completed",
                 detail,
-                {"chunk_count": len(run.chunks), "video_count": matched_videos},
+                {"chunk_count": len(run.chunks), "source_count": matched_sources},
             )
 
         if tool_name == "system_context":
@@ -709,9 +786,15 @@ class RagService:
         index_service: KnowledgeIndexService,
         tag_service: TagService,
         settings: ServiceSettings,
+        knowledge_user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
     ) -> None:
         self._tag_service = tag_service
-        self._agent = KnowledgeAgent(repository, index_service, settings)
+        self._agent = KnowledgeAgent(
+            repository,
+            index_service,
+            settings,
+            knowledge_user_id=knowledge_user_id,
+        )
 
     def ask(
         self,

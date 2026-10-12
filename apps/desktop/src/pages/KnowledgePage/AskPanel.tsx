@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { SVGProps } from "react";
 import { Link } from "react-router-dom";
 
+import { ExternalLinkIcon } from "../../components/AppIcons";
 import { MarkdownContent } from "../../components/MarkdownContent";
 import type { KnowledgeJob, KnowledgeReference, KnowledgeReferenceItem, KnowledgeSourceRef, KnowledgeSuggestion, KnowledgeToolTrace } from "../../types";
 
@@ -126,7 +127,7 @@ function formatSourceMeta(source: KnowledgeSourceRef) {
 function buildSourceCards(sources: KnowledgeSourceRef[] = []) {
   const sourceMap = new Map<string, KnowledgeSourceRef & { timestamps: string[] }>();
   sources.forEach((source) => {
-    const key = source.video_id || source.title;
+    const key = `${source.source_kind || "video"}-${source.source_id || source.video_id || source.title}`;
     const existing = sourceMap.get(key);
     const timestamps = source.timestamp ? [source.timestamp] : [];
     if (!existing) {
@@ -146,6 +147,20 @@ function buildSourceCards(sources: KnowledgeSourceRef[] = []) {
     existing.timestamps = nextTimestamps;
   });
   return [...sourceMap.values()].slice(0, 4);
+}
+
+function KnowledgeSourceCard({ source }: { source: KnowledgeSourceRef & { timestamps: string[] } }) {
+  const content = (
+    <>
+      <strong>{source.title}{source.source_kind === "article" ? <ExternalLinkIcon aria-hidden="true" /> : null}</strong>
+      <span>{formatSourceMeta(source)}</span>
+      {source.timestamps.length ? <small>{source.timestamps.slice(0, 3).join(" / ")}</small> : null}
+    </>
+  );
+  if (source.source_kind === "article" && source.source_url) {
+    return <a className="knowledge-chat-source-card" href={source.source_url} target="_blank" rel="noreferrer">{content}</a>;
+  }
+  return <Link className="knowledge-chat-source-card" to={`/videos/${source.video_id}`}>{content}</Link>;
 }
 
 function ToolTimeline({ tools = [] }: { tools?: KnowledgeToolTrace[] }) {
@@ -436,11 +451,7 @@ export function AskPanel({
                       </summary>
                       <div className="knowledge-chat-sources">
                         {buildSourceCards(message.sources).map((source) => (
-                          <Link key={source.video_id || source.title} className="knowledge-chat-source-card" to={`/videos/${source.video_id}`}>
-                            <strong>{source.title}</strong>
-                            <span>{formatSourceMeta(source)}</span>
-                            {source.timestamps.length ? <small>{source.timestamps.slice(0, 3).join(" / ")}</small> : null}
-                          </Link>
+                          <KnowledgeSourceCard key={`${source.source_kind}-${source.source_id || source.video_id || source.title}`} source={source} />
                         ))}
                       </div>
                     </details>

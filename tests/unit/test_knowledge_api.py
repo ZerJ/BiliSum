@@ -1,5 +1,9 @@
 import sqlite3
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
 import httpx
+import pytest
 from fastapi import HTTPException
 
 from video_sum_core.models.tasks import TaskResult
@@ -25,7 +29,11 @@ from video_sum_service.knowledge.rag_service import (
 from video_sum_service.knowledge.tag_service import TagService
 from video_sum_service.repository import SqliteTaskRepository
 from video_sum_service.routers import knowledge as knowledge_router
-from video_sum_service.schemas import VideoAssetRecord
+from video_sum_service.schemas import (
+    KnowledgeArticleImportRequest,
+    KnowledgeDocumentRecord,
+    VideoAssetRecord,
+)
 
 
 class FakeEmbedder:
@@ -108,6 +116,123 @@ def enable_knowledge_for_router_tests(settings: ServiceSettings, monkeypatch) ->
     settings_manager._settings = enabled
     monkeypatch.setattr(knowledge_router, "_knowledge_runtime_ready", lambda: True)
     return enabled
+
+
+def seed_article(
+    repository: SqliteTaskRepository,
+    *,
+    title: str = "微信文章",
+    updated_at: datetime | None = None,
+) -> KnowledgeDocumentRecord:
+    timestamp = updated_at or datetime.now(timezone.utc)
+    return repository.upsert_knowledge_document(
+        KnowledgeDocumentRecord(
+            source_url="https://mp.weixin.qq.com/s/article-token",
+            canonical_url=f"https://mp.weixin.qq.com/s/{title}",
+            source_type="wechat_article",
+            title=title,
+            author="测试作者",
+            published_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            cover_url="https://mmbiz.qpic.cn/cover.jpg",
+            content_markdown=f"# {title}\n\n完整正文\n\n![配图](https://mmbiz.qpic.cn/image.jpg)",
+            plain_text=f"{title} 完整正文",
+            summary_markdown="### 核心结论\n\n这是文章正文总结。",
+            image_count=3,
+            analyzed_image_count=2,
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+    )
+
+
+def test_knowledge_article_list_returns_newest_first() -> None:
+    repository = create_repository()
+    older = seed_article(repository, title="较早文章", updated_at=datetime.now(timezone.utc) - timedelta(days=1))
+    newer = seed_article(repository, title="最新文章", updated_at=datetime.now(timezone.utc))
+
+    response = knowledge_router.list_knowledge_articles(create_request(repository))
+
+    assert [item.document_id for item in response] == [newer.document_id, older.document_id]
+    assert response[0].author == "测试作者"
+    assert not hasattr(response[0], "content_markdown")
+
+
+def test_knowledge_article_detail_returns_full_markdown() -> None:
+    repository = create_repository()
+    article = seed_article(repository, title="可阅读文章")
+
+    response = knowledge_router.get_knowledge_article(article.document_id, create_request(repository))
+
+    assert response.document_id == article.document_id
+    assert response.content_markdown == article.content_markdown
+    assert response.image_count == 3
+    assert response.analyzed_image_count == 2
+
+
+def test_knowledge_article_detail_returns_404_for_missing_document() -> None:
+    repository = create_repository()
+
+    try:
+        knowledge_router.get_knowledge_article("missing-document", create_request(repository))
+    except HTTPException as exc:
+        assert exc.status_code == 404
+        assert "文章不存在" in str(exc.detail)
+    else:
+        raise AssertionError("expected HTTPException")
+
+
+def test_knowledge_article_import_indexes_document_and_returns_response(monkeypatch) -> None:
+    repository = create_repository()
+    settings = enable_knowledge_for_router_tests(ServiceSettings(), monkeypatch)
+    article = seed_article(repository, title="新导入文章")
+    indexed_document_ids: list[str] = []
+
+    class FakeArticleIngestionService:
+        def __init__(self, actual_repository, actual_settings, user_id) -> None:
+            assert actual_repository is repository
+            assert actual_settings is settings
+            assert user_id == "default"
+
+        def import_url(self, url, *, analyze_images, summarize, force_refresh):
+            assert url == article.source_url
+            assert analyze_images is False
+            assert summarize is True
+            assert force_refresh is True
+            return SimpleNamespace(
+                document=article,
+                cached=False,
+                replaced_document_ids=["replaced-document"],
+            )
+
+    class FakeIndexService:
+        def remove_document(self, document_id: str) -> bool:
+            indexed_document_ids.append(f"removed:{document_id}")
+            return True
+
+        def index_document(self, document_id: str) -> int:
+            indexed_document_ids.append(document_id)
+            return 3
+
+    monkeypatch.setattr(knowledge_router, "ArticleIngestionService", FakeArticleIngestionService)
+    monkeypatch.setattr(
+        knowledge_router,
+        "_get_services",
+        lambda _request: (object(), FakeIndexService(), object()),
+    )
+
+    response = knowledge_router.import_knowledge_article(
+        KnowledgeArticleImportRequest(
+            url=article.source_url,
+            analyze_images=False,
+            force_refresh=True,
+        ),
+        create_request(repository),
+    )
+
+    assert response.document == article
+    assert response.indexed_chunks == 3
+    assert response.cached is False
+    assert indexed_document_ids == ["removed:replaced-document", article.document_id]
 
 
 def seed_video(repository: SqliteTaskRepository, video_id_suffix: str = "knowledge") -> VideoAssetRecord:
@@ -314,6 +439,23 @@ def test_knowledge_service_signature_changes_with_runtime_channel() -> None:
     )
 
     assert base_signature != gpu_signature
+
+
+def test_knowledge_service_signature_changes_with_embedding_configuration() -> None:
+    huggingface_signature = knowledge_router._knowledge_settings_signature(
+        ServiceSettings(
+            knowledge_embedding_provider="local_huggingface",
+            knowledge_embedding_model="BAAI/bge-small-zh-v1.5",
+        )
+    )
+    modelscope_signature = knowledge_router._knowledge_settings_signature(
+        ServiceSettings(
+            knowledge_embedding_provider="local_modelscope",
+            knowledge_embedding_model="BAAI/bge-small-zh-v1.5",
+        )
+    )
+
+    assert huggingface_signature != modelscope_signature
 
 
 def test_knowledge_sources_prefer_multi_page_title(monkeypatch) -> None:
@@ -654,6 +796,88 @@ def test_chat_knowledge_llm_returns_clear_timeout_error(monkeypatch) -> None:
         assert "响应超时" in str(exc.detail)
     else:
         raise AssertionError("expected HTTPException")
+
+
+def test_chat_knowledge_llm_retries_transient_connect_timeout(monkeypatch) -> None:
+    settings = ServiceSettings(
+        knowledge_llm_mode="custom",
+        knowledge_llm_enabled=True,
+        knowledge_llm_base_url="https://api.example.com/v1",
+        knowledge_llm_api_key="test-key",
+        knowledge_llm_model="remote-model",
+    )
+    post_calls = 0
+    client_timeouts: list[httpx.Timeout] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": {"content": "重试成功"}}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            client_timeouts.append(kwargs["timeout"])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, *args, **kwargs):
+            nonlocal post_calls
+            post_calls += 1
+            if post_calls == 1:
+                raise httpx.ConnectTimeout("timed out")
+            return FakeResponse()
+
+    monkeypatch.setattr("video_sum_service.knowledge.local_llm.httpx.Client", FakeClient)
+
+    content, _body = chat_knowledge_llm(
+        settings,
+        system_prompt="system",
+        user_prompt="user",
+    )
+
+    assert content == "重试成功"
+    assert post_calls == 2
+    assert client_timeouts[0].connect == 30.0
+
+
+def test_chat_knowledge_llm_reports_connect_timeout_after_retry(monkeypatch) -> None:
+    settings = ServiceSettings(
+        knowledge_llm_mode="custom",
+        knowledge_llm_enabled=True,
+        knowledge_llm_base_url="https://api.example.com/v1",
+        knowledge_llm_api_key="test-key",
+        knowledge_llm_model="remote-model",
+    )
+    post_calls = 0
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, *args, **kwargs):
+            nonlocal post_calls
+            post_calls += 1
+            raise httpx.ConnectTimeout("timed out")
+
+    monkeypatch.setattr("video_sum_service.knowledge.local_llm.httpx.Client", FakeClient)
+
+    with pytest.raises(HTTPException) as exc_info:
+        chat_knowledge_llm(settings, system_prompt="system", user_prompt="user")
+
+    assert post_calls == 2
+    assert exc_info.value.status_code == 504
+    assert "连接超时" in str(exc_info.value.detail)
 
 
 def test_chat_knowledge_llm_normalizes_mimo_model(monkeypatch) -> None:

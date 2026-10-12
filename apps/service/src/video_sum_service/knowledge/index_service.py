@@ -15,8 +15,12 @@ from fastapi import HTTPException
 
 from video_sum_infra.config import ServiceSettings
 from video_sum_infra.runtime import activate_runtime_pythonpath, app_data_root
-from video_sum_service.repository import SqliteTaskRepository
-from video_sum_service.schemas import KnowledgeIndexChunkRecord, KnowledgeSearchResult
+from video_sum_service.repository import DEFAULT_KNOWLEDGE_USER_ID, SqliteTaskRepository
+from video_sum_service.schemas import (
+    KnowledgeDocumentChunkRecord,
+    KnowledgeIndexChunkRecord,
+    KnowledgeSearchResult,
+)
 
 logger = logging.getLogger("video_sum_service.knowledge")
 
@@ -51,10 +55,12 @@ class KnowledgeIndexService:
         settings: ServiceSettings,
         chroma_path: str | Path | None = None,
         model_name: str = "",
+        knowledge_user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
     ) -> None:
         self._repository = repository
         self._settings = settings
         self._model_name = model_name or settings.knowledge_embedding_model
+        self._knowledge_user_id = knowledge_user_id
         self._chroma_path = Path(chroma_path or (app_data_root() / "knowledge_index"))
         self._embedder = None
         self._collection = None
@@ -437,7 +443,13 @@ class KnowledgeIndexService:
         if not chunks:
             return True
 
-        tags = [item.tag for item in self._repository.list_video_tags(video_id)]
+        tags = [
+            item.tag
+            for item in self._repository.list_video_tags(
+                video_id,
+                user_id=DEFAULT_KNOWLEDGE_USER_ID,
+            )
+        ]
         task = self._repository.get_task(asset.latest_task_id) if asset.latest_task_id else None
         page_number = int(task.page_number) if task is not None and task.page_number is not None else None
         page_title = str(task.page_title or task.task_input.title or "").strip() if task is not None else ""
@@ -447,6 +459,8 @@ class KnowledgeIndexService:
             embeddings=[json.loads(chunk.embedding_json) for chunk in chunks],
             metadatas=[
                 {
+                    "source_kind": "video",
+                    "source_id": chunk.video_id,
                     "video_id": chunk.video_id,
                     "index_type": chunk.index_type,
                     "anchor_label": chunk.anchor_label or "",
@@ -456,11 +470,117 @@ class KnowledgeIndexService:
                     "page_title": page_title,
                     "display_title": page_title or asset.title,
                     "cover_url": asset.cover_url or "",
+                    "source_url": asset.source_url,
                     "tags_json": json.dumps(tags, ensure_ascii=False),
                 }
                 for chunk in chunks
             ],
         )
+        return True
+
+    def _build_chunks_for_document(
+        self,
+        document_id: str,
+    ) -> tuple[Any, list[KnowledgeDocumentChunkRecord]]:
+        document = self._repository.get_knowledge_document(document_id)
+        if document is None:
+            return None, []
+        sections = self._split_markdown_sections(document.content_markdown)
+        if not sections and document.plain_text.strip():
+            sections = [(document.title, document.plain_text.strip())]
+        chunk_specs: list[dict[str, object]] = []
+        if document.summary_markdown.strip():
+            chunk_specs.append(
+                {
+                    "index_type": "article_summary",
+                    "segment_order": 0,
+                    "anchor_label": "正文总结",
+                    "content": (
+                        f"{document.title}\n正文总结\n{document.summary_markdown}"
+                    ).strip(),
+                }
+            )
+        chunk_specs.extend(
+            [
+                {
+                    "index_type": "article_section",
+                    "segment_order": index + 1,
+                    "anchor_label": title,
+                    "content": f"{document.title}\n{title}\n{body}".strip(),
+                }
+                for index, (title, body) in enumerate(sections)
+                if body.strip()
+            ]
+        )
+        if not chunk_specs:
+            return document, []
+        vectors = self._embed_texts([str(item["content"]) for item in chunk_specs])
+        now = datetime.now(timezone.utc)
+        chunks = [
+            KnowledgeDocumentChunkRecord(
+                chunk_id=(
+                    f"document:{document_id}:{item['index_type']}:{item['segment_order']}"
+                ),
+                document_id=document_id,
+                embedding_json=json.dumps(vectors[index], ensure_ascii=False),
+                indexed_content=str(item["content"]),
+                index_type=str(item["index_type"]),
+                segment_order=int(item["segment_order"]),
+                anchor_label=str(item["anchor_label"]),
+                created_at=now,
+                updated_at=now,
+            )
+            for index, item in enumerate(chunk_specs)
+        ]
+        return document, chunks
+
+    def index_document(self, document_id: str) -> int:
+        document, chunks = self._build_chunks_for_document(document_id)
+        if document is None:
+            return 0
+        collection = self._get_collection()
+        try:
+            collection.delete(where={"document_id": document_id})
+        except Exception:
+            pass
+        self._repository.replace_knowledge_document_chunks(document_id, chunks)
+        if not chunks:
+            return 0
+        collection.add(
+            ids=[chunk.chunk_id for chunk in chunks],
+            documents=[chunk.indexed_content for chunk in chunks],
+            embeddings=[json.loads(chunk.embedding_json) for chunk in chunks],
+            metadatas=[
+                {
+                    "source_kind": "article",
+                    "source_id": document.document_id,
+                    "document_id": document.document_id,
+                    "video_id": "",
+                    "index_type": chunk.index_type,
+                    "anchor_label": chunk.anchor_label or "",
+                    "anchor_seconds": -1.0,
+                    "title": document.title,
+                    "display_title": document.title,
+                    "page_number": -1,
+                    "page_title": "",
+                    "cover_url": document.cover_url,
+                    "source_url": document.source_url,
+                    "author": document.author,
+                    "tags_json": "[]",
+                }
+                for chunk in chunks
+            ],
+        )
+        return len(chunks)
+
+    def remove_document(self, document_id: str) -> bool:
+        self._repository.delete_knowledge_document_chunks(document_id)
+        try:
+            self._get_collection().delete(where={"document_id": document_id})
+        except HTTPException:
+            raise
+        except Exception:
+            pass
         return True
 
     def remove_video(self, video_id: str) -> bool:
@@ -475,7 +595,12 @@ class KnowledgeIndexService:
 
     def rebuild_index(self, force: bool = False) -> int:
         del force
-        videos = [video for video in self._repository.list_video_assets() if video.latest_result is not None]
+        videos = [
+            video
+            for video_id in self._repository.list_all_knowledge_video_ids()
+            if (video := self._repository.get_video_asset(video_id)) is not None
+            and video.latest_result is not None
+        ]
         collection = self._get_collection()
         try:
             existing = collection.get()
@@ -486,10 +611,13 @@ class KnowledgeIndexService:
             pass
 
         self._repository.clear_knowledge_chunks()
+        self._repository.clear_knowledge_document_chunks()
         count = 0
         for video in videos:
             if self.index_video(video.video_id):
                 count += 1
+        for document in self._repository.list_knowledge_documents():
+            self.index_document(document.document_id)
         return count
 
     def _fetch_candidate_chunks(
@@ -502,44 +630,83 @@ class KnowledgeIndexService:
         cleaned_query = str(query or "").strip()
         if not cleaned_query:
             return []
-        if self._repository.get_knowledge_chunk_count() == 0:
+        if (
+            self._repository.get_knowledge_chunk_count() == 0
+            and self._repository.get_knowledge_document_chunk_count() == 0
+        ):
             self.rebuild_index()
+
+        allowed_video_ids = self._repository.list_knowledge_content_ids(
+            self._knowledge_user_id,
+            "video",
+        )
+        allowed_article_ids = self._repository.list_knowledge_content_ids(
+            self._knowledge_user_id,
+            "article",
+        )
+        if tag_filter:
+            selected = {tag.strip() for tag in tag_filter if str(tag).strip()}
+            if selected:
+                allowed_video_ids &= {
+                    item.video_id
+                    for item in self._repository.list_all_video_tags(self._knowledge_user_id)
+                    if item.tag in selected
+                }
+                allowed_article_ids.clear()
+        if video_ids is not None:
+            allowed_video_ids &= set(video_ids)
+            allowed_article_ids.clear()
+        allowed_source_ids = allowed_video_ids | allowed_article_ids
+        if not allowed_source_ids:
+            return []
 
         effective_limit = max(limit * 4, 12)
         query_embedding = self._embed_texts([cleaned_query])[0]
-        query_result = self._get_collection().query(
-            query_embeddings=[query_embedding],
-            n_results=effective_limit,
-        )
+        collection = self._get_collection()
+        where_conditions = [{"source_id": {"$in": sorted(allowed_source_ids)}}]
+        if allowed_video_ids:
+            where_conditions.append({"video_id": {"$in": sorted(allowed_video_ids)}})
+        if allowed_article_ids:
+            where_conditions.append({"document_id": {"$in": sorted(allowed_article_ids)}})
+        where = {"$or": where_conditions} if len(where_conditions) > 1 else where_conditions[0]
+        try:
+            query_result = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=effective_limit,
+                where=where,
+            )
+        except TypeError:
+            # Lightweight test adapters may implement only the basic query interface.
+            query_result = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=max(
+                    effective_limit,
+                    self._repository.get_knowledge_chunk_count()
+                    + self._repository.get_knowledge_document_chunk_count(),
+                ),
+            )
         ids = query_result.get("ids", [[]])[0] if isinstance(query_result, dict) else []
         documents = query_result.get("documents", [[]])[0] if isinstance(query_result, dict) else []
         metadatas = query_result.get("metadatas", [[]])[0] if isinstance(query_result, dict) else []
         distances = query_result.get("distances", [[]])[0] if isinstance(query_result, dict) else []
 
-        allowed_video_ids: set[str] | None = None
-        if tag_filter:
-            selected = {tag.strip() for tag in tag_filter if str(tag).strip()}
-            if selected:
-                allowed_video_ids = {
-                    item.video_id
-                    for item in self._repository.list_all_video_tags()
-                    if item.tag in selected
-                }
-
-        if video_ids is not None:
-            allowed_video_ids = set(video_ids) if allowed_video_ids is None else allowed_video_ids & set(video_ids)
-
         candidates: list[dict[str, object]] = []
         for index, chunk_id in enumerate(ids):
             metadata = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
+            source_kind = str(metadata.get("source_kind") or "video")
+            source_id = str(metadata.get("source_id") or metadata.get("video_id") or metadata.get("document_id") or "")
             video_id = str(metadata.get("video_id") or "")
-            if allowed_video_ids is not None and video_id not in allowed_video_ids:
+            if source_kind == "article" and source_id not in allowed_article_ids:
+                continue
+            if source_kind != "article" and video_id not in allowed_video_ids:
                 continue
             distance = float(distances[index]) if index < len(distances) else 1.0
             relevance = max(0.0, 1.0 - distance / 2.0)
             candidates.append(
                 {
                     "chunk_id": chunk_id,
+                    "source_kind": source_kind,
+                    "source_id": source_id,
                     "video_id": video_id,
                     "document": documents[index] if index < len(documents) else "",
                     "metadata": metadata,
@@ -559,19 +726,40 @@ class KnowledgeIndexService:
         if not candidates:
             return []
 
-        grouped: dict[str, dict[str, object]] = {}
+        grouped: dict[tuple[str, str], dict[str, object]] = {}
         for candidate in candidates:
-            video_id = str(candidate["video_id"])
-            current = grouped.get(video_id)
+            source_key = (str(candidate.get("source_kind") or "video"), str(candidate.get("source_id") or ""))
+            current = grouped.get(source_key)
             if current is None or float(candidate["relevance_score"]) > float(current["relevance_score"]):
-                grouped[video_id] = candidate
+                grouped[source_key] = candidate
 
         ordered = sorted(grouped.values(), key=lambda item: float(item["relevance_score"]), reverse=True)[: max(1, limit)]
         results: list[KnowledgeSearchResult] = []
         for candidate in ordered:
+            source_kind = str(candidate.get("source_kind") or "video")
+            source_id = str(candidate.get("source_id") or "")
+            metadata = candidate["metadata"] if isinstance(candidate["metadata"], dict) else {}
+            if source_kind == "article":
+                document = self._repository.get_knowledge_document(source_id)
+                if document is None:
+                    continue
+                title = document.title
+                snippet = str(candidate["document"]).strip().replace("\n", " ")
+                snippet = snippet[:180].rstrip() + ("..." if len(snippet) > 180 else "")
+                results.append(
+                    KnowledgeSearchResult(
+                        source_kind="article",
+                        source_id=source_id,
+                        source_url=document.source_url,
+                        title=title,
+                        relevance_score=float(candidate["relevance_score"]),
+                        snippet=snippet,
+                        cover_url=document.cover_url,
+                    )
+                )
+                continue
             video_id = str(candidate["video_id"])
             asset = self._repository.get_video_asset(video_id)
-            metadata = candidate["metadata"] if isinstance(candidate["metadata"], dict) else {}
             video_title = asset.title if asset is not None else str(metadata.get("title") or "未知视频")
             page_title = str(metadata.get("page_title") or metadata.get("display_title") or "").strip()
             if page_title == video_title:
@@ -580,10 +768,19 @@ class KnowledgeIndexService:
             page_number = int(page_number_raw) if isinstance(page_number_raw, (int, float)) and int(page_number_raw) > 0 else None
             snippet = str(candidate["document"]).strip().replace("\n", " ")
             snippet = snippet[:180].rstrip() + ("..." if len(snippet) > 180 else "")
-            tags = [item.tag for item in self._repository.list_video_tags(video_id)]
+            tags = [
+                item.tag
+                for item in self._repository.list_video_tags(
+                    video_id,
+                    user_id=self._knowledge_user_id,
+                )
+            ]
             results.append(
                 KnowledgeSearchResult(
                     video_id=video_id,
+                    source_kind="video",
+                    source_id=video_id,
+                    source_url=asset.source_url if asset is not None else str(metadata.get("source_url") or ""),
                     title=page_title or video_title,
                     relevance_score=float(candidate["relevance_score"]),
                     snippet=snippet,

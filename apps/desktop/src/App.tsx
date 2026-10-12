@@ -1,5 +1,5 @@
 import { type ChangeEvent, type FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { Link, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 
 import {
   deriveRuntimeDeviceLabel,
@@ -14,10 +14,11 @@ import {
   type Snapshot,
   type UpdateState,
 } from "./appModel";
-import { AuthRequiredError, api } from "./api";
+import { AuthRequiredError, api, type BilibiliCookieCaptureResponse } from "./api";
 import { HomeIcon, KnowledgeIcon, LibraryIcon, SettingsIcon } from "./components/AppIcons";
 import { CollectionSelectDialog } from "./components/CollectionSelectDialog";
 import { CookieHelpDialog } from "./components/CookieHelpDialog";
+import { DouyinLoginDialog } from "./components/DouyinLoginDialog";
 import { MultiPageSelectDialog } from "./components/MultiPageSelectDialog";
 import { SetupAssistantDialog } from "./components/SetupAssistantDialog";
 import { StartupAnnouncementDialog, type StartupAnnouncement } from "./components/StartupAnnouncementDialog";
@@ -26,11 +27,13 @@ import { UpdateDialog, type UpdateInfo } from "./components/UpdateDialog";
 import { HomeTour, isHomeTourSeen } from "./components/HomeTour";
 import { HomePage } from "./pages/HomePage";
 import { KnowledgePage } from "./pages/KnowledgePage";
+import { AccountMenu } from "./pages/KnowledgePage/AccountMenu";
+import { KnowledgeArticlePage } from "./pages/KnowledgeArticlePage";
 import { LibraryPage } from "./pages/LibraryPage";
 import { CollectionDetailPage } from "./pages/CollectionDetailPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { VideoDetailPage } from "./pages/VideoDetailPage";
-import type { CollectionGroupMode, CollectionSortMode, VideoAssetSummary, VideoCollection, VideoCollectionItem, VideoPageBatchOption, VideoProbeResult } from "./types";
+import type { CollectionGroupMode, CollectionSortMode, KnowledgeUser, VideoAssetSummary, VideoCollection, VideoCollectionItem, VideoPageBatchOption, VideoProbeResult } from "./types";
 
 const PROMPT_PRESET_STORAGE_KEY = "bilisum.promptPresetId";
 
@@ -140,13 +143,18 @@ export function App() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
-  const [authenticated, setAuthenticated] = useState<boolean>(() => Boolean(window.desktop));
+  const [authenticated, setAuthenticated] = useState(false);
+  const [account, setAccount] = useState<KnowledgeUser | null>(null);
+  const [setupRequired, setSetupRequired] = useState(false);
+  const [authName, setAuthName] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
   const [authToken, setAuthToken] = useState("");
   const [authError, setAuthError] = useState("");
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [startupAnnouncement, setStartupAnnouncement] = useState<StartupAnnouncement | null>(null);
   const [setupAssistantOpen, setSetupAssistantOpen] = useState(false);
   const [cookieHelpDialogOpen, setCookieHelpDialogOpen] = useState(false);
+  const [douyinLoginDialogOpen, setDouyinLoginDialogOpen] = useState(false);
   const [setupAssistantDismissed, setSetupAssistantDismissed] = useState(false);
   const setupAssistantForceRef = useRef(false);
   // A periodic refresh can finish after a settings PUT. Keep older responses
@@ -174,39 +182,17 @@ export function App() {
   useEffect(() => {
     let disposed = false;
     async function checkAuth() {
-      if (window.desktop) {
-        try {
-          await api.createAuthSession(await window.desktop.backend.getAccessToken());
-        } catch {
-          // Auth headers are still attached to desktop fetches; session setup mainly supports EventSource.
-        }
-        if (!disposed) {
-          setAuthenticated(true);
-          setAuthChecked(true);
-        }
-        return;
-      }
       const urlToken = readAuthTokenFromUrl();
       if (urlToken) {
-        try {
-          const status = await api.createAuthSession(urlToken);
-          if (!disposed) {
-            setAuthenticated(Boolean(status.authenticated));
-            setAuthChecked(true);
-          }
-        } catch {
-          if (!disposed) {
-            setAuthenticated(false);
-            setAuthChecked(true);
-          }
-        }
+        setAuthToken(urlToken);
         clearAuthTokenFromUrl();
-        return;
       }
       try {
         const status = await api.getAuthStatus();
         if (!disposed) {
           setAuthenticated(Boolean(status.authenticated));
+          setAccount(status.account || null);
+          setSetupRequired(Boolean(status.setupRequired));
           setAuthChecked(true);
         }
       } catch {
@@ -364,20 +350,29 @@ export function App() {
 
   async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const token = authToken.trim();
-    if (!token) {
-      setAuthError("请输入访问密钥。");
+    if (!authName.trim() || !authPassword) {
+      setAuthError("请输入用户名和密码。");
       return;
     }
     setAuthSubmitting(true);
     setAuthError("");
     try {
-      const status = await api.createAuthSession(token);
+      const token = setupRequired ? (window.desktop ? await window.desktop.backend.getAccessToken() : authToken.trim()) : "";
+      if (setupRequired && !token) {
+        setAuthError("首次设置需要服务访问密钥。");
+        return;
+      }
+      const status = setupRequired
+        ? await api.setupAccount(authName.trim(), authPassword, token)
+        : await api.loginAccount(authName.trim(), authPassword);
       setAuthenticated(Boolean(status.authenticated));
+      setAccount(status.account || null);
+      setSetupRequired(false);
       setAuthToken("");
+      setAuthPassword("");
       setRefreshSeed((current) => current + 1);
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "访问密钥无效。");
+      setAuthError(error instanceof Error ? error.message : "登录失败。");
     } finally {
       setAuthSubmitting(false);
     }
@@ -555,6 +550,10 @@ export function App() {
   }, [runtimeStartupStatus, snapshot.environment, snapshot.runtimeInitializing, snapshot.serviceOnline]);
 
   useEffect(() => {
+    if (!account?.is_admin) {
+      setSetupAssistantOpen(false);
+      return;
+    }
     const shouldOpen = shouldShowSetupAssistant(configHealth, snapshot.settings);
     if (!shouldOpen) {
       if (!setupAssistantForceRef.current) {
@@ -567,7 +566,7 @@ export function App() {
     if (!setupAssistantDismissed) {
       setSetupAssistantOpen(true);
     }
-  }, [configHealth, setupAssistantDismissed, snapshot.settings]);
+  }, [account?.is_admin, configHealth, setupAssistantDismissed, snapshot.settings]);
 
   function navigateToConfigIssue(issueKey: string) {
     setupAssistantForceRef.current = false;
@@ -796,6 +795,7 @@ export function App() {
   }
 
   function openConfigAssist(issueKey?: string) {
+    if (!account?.is_admin) return;
     if (issueKey) {
       navigateToConfigIssue(issueKey);
       return;
@@ -826,12 +826,26 @@ export function App() {
   }
 
   function isBilibiliCookieHelpError(message: string) {
+    if (/抖音/i.test(message)) return false;
     return /HTTP\s*412|cookies?\.txt|B\s*站返回|Bilibili rejected|风控拦截|登录态|cookiesfrombrowser|DPAPI/i.test(message);
   }
 
   function showBilibiliCookieHelp(message: string) {
     setSubmitStatus(message || "B 站请求被拦截，请导出登录态 cookies 后重试。");
     setCookieHelpDialogOpen(true);
+  }
+
+  function showSiteCookieHelp(message: string): boolean {
+    if (/抖音/i.test(message) && /登录态|cookie|风控|HTTP\s*(401|403|412)/i.test(message)) {
+      setSubmitStatus(message);
+      setDouyinLoginDialogOpen(true);
+      return true;
+    }
+    if (isBilibiliCookieHelpError(message)) {
+      showBilibiliCookieHelp(message);
+      return true;
+    }
+    return false;
   }
 
   function openCookieExportTutorial() {
@@ -845,39 +859,49 @@ export function App() {
   }
 
   async function captureBilibiliLoginCookies() {
+    if (!window.desktop?.bilibili) {
+      setCookieHelpDialogOpen(true);
+      return;
+    }
     try {
-      const currentProbeUrl = probeUrl.trim();
-      if (!window.desktop?.bilibili) {
-        setSubmitStatus("当前环境不支持打开 B 站登录窗口，请按教程手动导出 cookies.txt。");
-        return;
-      }
       setSubmitStatus("请在新窗口登录 B 站，登录成功后会自动保存 cookies...");
       const captured = await window.desktop.bilibili.captureLoginCookies();
-      const response = await api.updateSettings({
-        ytdlp_cookies_file: captured.cookiesFile,
-        ytdlp_cookies_browser: "",
-      });
-      setSnapshot((current) => ({
-        ...current,
-        settings: response.settings,
-        systemInfo: current.systemInfo
-          ? {
-              ...current.systemInfo,
-              settings: response.settings,
-            }
-          : current.systemInfo,
-      }));
-      if (currentProbeUrl) {
-        await api.probeVideo({ url: currentProbeUrl, force_refresh: true });
-        setSubmitStatus(`B 站登录态已保存，捕获 ${captured.cookieCount} 条 cookies。可以重新提交任务。`);
-      } else {
-        setSubmitStatus(`B 站登录态已保存，捕获 ${captured.cookieCount} 条 cookies。重新提交任务即可。`);
-      }
-      setCookieHelpDialogOpen(false);
+      await saveSiteLoginCookies(captured);
     } catch (error) {
       setSubmitStatus(error instanceof Error ? error.message : "捕获 B 站登录态失败，请按教程手动导出 cookies.txt。");
       setCookieHelpDialogOpen(true);
     }
+  }
+
+  async function saveSiteLoginCookies(captured: BilibiliCookieCaptureResponse, siteLabel = "B 站") {
+    const currentProbeUrl = probeUrl.trim();
+    settingsWriteVersionRef.current += 1;
+    const response = await api.updateSettings({
+      ytdlp_cookies_file: captured.cookiesFile,
+      ytdlp_cookies_browser: "",
+    });
+    setSnapshot((current) => ({
+      ...current,
+      settings: response.settings,
+      systemInfo: current.systemInfo
+        ? {
+            ...current.systemInfo,
+            settings: response.settings,
+          }
+        : current.systemInfo,
+    }));
+    if (currentProbeUrl) {
+      try {
+        await api.probeVideo({ url: currentProbeUrl, force_refresh: true });
+      } catch (error) {
+        setSubmitStatus(`${siteLabel}登录态已保存，但视频请求仍失败：${error instanceof Error ? error.message : "请稍后重试。"}`);
+        return;
+      }
+      setSubmitStatus(`${siteLabel}登录态已保存，捕获 ${captured.cookieCount} 条 cookies。可以重新提交任务。`);
+    } else {
+      setSubmitStatus(`${siteLabel}登录态已保存，捕获 ${captured.cookieCount} 条 cookies。重新提交任务即可。`);
+    }
+    setCookieHelpDialogOpen(false);
   }
 
   function resolveVisualNoteModeFromPreference(): string | null {
@@ -934,8 +958,7 @@ export function App() {
       setDetailRefreshToken((value) => value + 1);
     } catch (error) {
       const message = error instanceof Error ? error.message : "创建摘要任务失败";
-      if (isBilibiliCookieHelpError(message)) {
-        showBilibiliCookieHelp(message);
+      if (showSiteCookieHelp(message)) {
         return;
       }
       setSubmitStatus(message);
@@ -1015,33 +1038,34 @@ export function App() {
       setDetailRefreshToken((value) => value + 1);
     } catch (error) {
       const message = readableTaskCreationError(error);
-      if (isBilibiliCookieHelpError(message)) {
-        showBilibiliCookieHelp(message);
+      if (showSiteCookieHelp(message)) {
         return;
       }
       setSubmitStatus(message);
     }
   }
 
-  async function handleProbe(event: FormEvent) {
+  async function handleProbe(event: FormEvent, source?: string) {
     event.preventDefault();
-    if (!probeUrl.trim()) {
-      setSubmitStatus("请输入 Bilibili / YouTube 视频链接，或直接输入 BV 号");
-      return;
+    const submittedUrl = (source ?? probeUrl).trim();
+    if (!submittedUrl) {
+      setSubmitStatus("请输入 Bilibili / YouTube / 抖音视频链接，或直接输入 BV 号");
+      return false;
     }
     if (configHealth.hasBlockingIssues) {
-      setSubmitStatus(`当前缺少必需配置：${configHealth.blockingIssues.map((item) => item.title).join("、")}。请先完成设置。`);
+      setSubmitStatus(`当前缺少必需配置：${configHealth.blockingIssues.map((item) => item.title).join("、")}。${account?.is_admin ? "请先完成设置。" : "请联系管理员配置。"}`);
+      if (!account?.is_admin) return false;
       if (shouldShowSetupAssistant(configHealth, snapshot.settings)) {
         setSetupAssistantDismissed(false);
         setSetupAssistantOpen(true);
       } else {
         navigate("/settings");
       }
-      return;
+      return false;
     }
     setSubmitStatus("正在抓取视频信息并准备开始总结...");
     try {
-      const response = await api.probeVideo({ url: probeUrl.trim(), force_refresh: false });
+      const response = await api.probeVideo({ url: submittedUrl, force_refresh: false });
       setProbePreview(response.video);
       if (response.collection?.items?.length) {
         setCollectionProbeVideo(response.video);
@@ -1049,24 +1073,24 @@ export function App() {
         setCollectionProbeCached(response.cached);
         setCollectionDialogOpen(true);
         setSubmitStatus(`检测到合集《${response.collection.title}》，请先选择总结范围`);
-        return;
+        return true;
       }
       if (response.requires_selection && response.pages.length > 0) {
         setMultiPageProbeVideo(response.video);
         setMultiPageOptions(response.pages.map((page) => ({ ...page, aggregate_status: "not_started", has_completed_result: false })));
         setMultiPageDialogOpen(true);
         setSubmitStatus(`检测到 ${response.pages.length} 个分 P，请先勾选要处理的内容`);
-        return;
+        return true;
       }
-      const submittedUrl = probeUrl.trim();
       startSingleVideoSummary(response.video, submittedUrl, response.cached);
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : "开始总结失败";
-      if (isBilibiliCookieHelpError(message)) {
-        showBilibiliCookieHelp(message);
-        return;
+      if (showSiteCookieHelp(message)) {
+        return false;
       }
       setSubmitStatus(message);
+      return false;
     }
   }
 
@@ -1130,8 +1154,7 @@ export function App() {
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "导入本地媒体失败";
-      if (isBilibiliCookieHelpError(message)) {
-        showBilibiliCookieHelp(message);
+      if (showSiteCookieHelp(message)) {
         return;
       }
       setSubmitStatus(message);
@@ -1140,7 +1163,8 @@ export function App() {
 
   async function handleImportLocalVideo() {
     if (configHealth.hasBlockingIssues) {
-      setSubmitStatus(`当前缺少必需配置：${configHealth.blockingIssues.map((item) => item.title).join("、")}。请先完成设置。`);
+      setSubmitStatus(`当前缺少必需配置：${configHealth.blockingIssues.map((item) => item.title).join("、")}。${account?.is_admin ? "请先完成设置。" : "请联系管理员配置。"}`);
+      if (!account?.is_admin) return;
       if (shouldShowSetupAssistant(configHealth, snapshot.settings)) {
         setSetupAssistantDismissed(false);
         setSetupAssistantOpen(true);
@@ -1176,7 +1200,8 @@ export function App() {
       return;
     }
     if (configHealth.hasBlockingIssues) {
-      setSubmitStatus(`当前缺少必需配置：${configHealth.blockingIssues.map((item) => item.title).join("、")}。请先完成设置。`);
+      setSubmitStatus(`当前缺少必需配置：${configHealth.blockingIssues.map((item) => item.title).join("、")}。${account?.is_admin ? "请先完成设置。" : "请联系管理员配置。"}`);
+      if (!account?.is_admin) return;
       if (shouldShowSetupAssistant(configHealth, snapshot.settings)) {
         setSetupAssistantDismissed(false);
         setSetupAssistantOpen(true);
@@ -1211,8 +1236,7 @@ export function App() {
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "导入本地媒体失败";
-      if (isBilibiliCookieHelpError(message)) {
-        showBilibiliCookieHelp(message);
+      if (showSiteCookieHelp(message)) {
         return;
       }
       setSubmitStatus(message);
@@ -1235,6 +1259,7 @@ export function App() {
       page_numbers: input.pageNumbers,
       confirm: input.confirm,
       prompt_preset_id: promptPresetId,
+      visual_note_mode: resolveVisualNoteModeFromPreference(),
     });
     if (response.requires_confirmation) {
       setSubmitStatus(`所选内容中有 ${response.conflict_pages.length} 个分 P 已有成功摘要，请确认后继续。`);
@@ -1275,19 +1300,25 @@ export function App() {
   const canInstallUpdates = Boolean(window.desktop?.update) && !isUpdateUnsupported(updateState);
   const canImportLocalVideo = Boolean(window.desktop?.media) || typeof window !== "undefined";
 
-  if (!window.desktop && authChecked && !authenticated) {
+  if (authChecked && !authenticated) {
     return (
       <AuthGate
+        setupRequired={setupRequired}
+        desktop={Boolean(window.desktop)}
+        name={authName}
+        password={authPassword}
         token={authToken}
         error={authError}
         submitting={authSubmitting}
+        onNameChange={setAuthName}
+        onPasswordChange={setAuthPassword}
         onTokenChange={setAuthToken}
         onSubmit={handleAuthSubmit}
       />
     );
   }
 
-  if (!window.desktop && !authChecked) {
+  if (!authChecked) {
     return (
       <div className="auth-shell">
         <section className="auth-panel">
@@ -1351,13 +1382,15 @@ export function App() {
               <strong>知识库</strong>
             </span>
           </Link>
-          <Link className={`nav-item ${location.pathname.startsWith("/settings") ? "active" : ""}`} to="/settings" aria-label="设置" title="设置" onClick={() => setMobileSidebarOpen(false)}>
+          {account?.is_admin ? <Link className={`nav-item ${location.pathname.startsWith("/settings") ? "active" : ""}`} to="/settings" aria-label="设置" title="设置" onClick={() => setMobileSidebarOpen(false)}>
             <span className="nav-icon" aria-hidden="true"><SettingsIcon /></span>
             <span className="nav-copy">
               <strong>设置</strong>
             </span>
-          </Link>
+          </Link> : null}
         </nav>
+
+        <AccountMenu />
 
         <div className="nav-section-divider"></div>
         <button
@@ -1431,6 +1464,7 @@ export function App() {
                 element={(
                   <HomePage
                     configHealth={configHealth}
+                    canConfigure={Boolean(account?.is_admin)}
                     probePreview={probePreview}
                     probeUrl={probeUrl}
                     setProbeUrl={setProbeUrl}
@@ -1484,7 +1518,8 @@ export function App() {
                   />
                 )}
               />
-              <Route path="/knowledge" element={<KnowledgePage />} />
+              <Route path="/knowledge" element={<KnowledgePage canConfigure={Boolean(account?.is_admin)} />} />
+              <Route path="/knowledge/articles/:documentId" element={<KnowledgeArticlePage />} />
               <Route
                 path="/collections/:collectionId"
                 element={(
@@ -1515,7 +1550,7 @@ export function App() {
               />
               <Route
                 path="/settings"
-                element={(
+                element={account?.is_admin ? (
                   <SettingsPage
                     desktop={desktop}
                     onOpenUpdateDialog={openUpdateDialog}
@@ -1551,7 +1586,7 @@ export function App() {
                     canCheckUpdate={canCheckUpdates}
                     canInstallUpdate={canInstallUpdates}
                   />
-                )}
+                ) : <Navigate to="/" replace />}
               />
             </Routes>
           )}
@@ -1587,20 +1622,26 @@ export function App() {
         onClose={handleCloseCollectionDialog}
         onChoose={handleChooseCollection}
       />
-      <SetupAssistantDialog
+      {account?.is_admin ? <SetupAssistantDialog
         isOpen={setupAssistantOpen}
         force={setupAssistantForceRef.current}
         configHealth={configHealth}
         onClose={closeSetupAssistant}
         onOpenSettings={openSettingsFromAssistant}
         onNavigateToIssue={navigateToConfigIssue}
-      />
+      /> : null}
       <CookieHelpDialog
         isOpen={cookieHelpDialogOpen}
         onClose={() => setCookieHelpDialogOpen(false)}
         onOpenTutorial={openCookieExportTutorial}
         onOpenSettings={openYtdlpCookieSettings}
         onCaptureLoginCookies={captureBilibiliLoginCookies}
+        onCookiesCaptured={account?.is_admin ? saveSiteLoginCookies : undefined}
+      />
+      <DouyinLoginDialog
+        isOpen={douyinLoginDialogOpen}
+        onClose={() => setDouyinLoginDialogOpen(false)}
+        onCookiesCaptured={account?.is_admin ? (captured) => saveSiteLoginCookies(captured, "抖音") : undefined}
       />
       {homeTourOpen && location.pathname === "/" && !configHealth.hasBlockingIssues ? (
         <HomeTour onClose={() => setHomeTourOpen(false)} />
@@ -1620,15 +1661,27 @@ function IconSidebarToggle({ collapsed }: { collapsed: boolean }) {
 }
 
 function AuthGate({
+  setupRequired,
+  desktop,
+  name,
+  password,
   token,
   error,
   submitting,
+  onNameChange,
+  onPasswordChange,
   onTokenChange,
   onSubmit,
 }: {
+  setupRequired: boolean;
+  desktop: boolean;
+  name: string;
+  password: string;
   token: string;
   error: string;
   submitting: boolean;
+  onNameChange(value: string): void;
+  onPasswordChange(value: string): void;
   onTokenChange(value: string): void;
   onSubmit(event: FormEvent<HTMLFormElement>): void;
 }) {
@@ -1639,29 +1692,29 @@ function AuthGate({
           <img src="/static/assets/icons/icon.svg" alt="" />
           <div>
             <span>BiliSum</span>
-            <h1>输入访问密钥</h1>
+            <h1>{setupRequired ? "设置管理员账户" : "登录账户"}</h1>
           </div>
         </div>
-        <p className="auth-muted">
-          Web 端访问需要 BiliSum 服务密钥。桌面端会自动注入密钥；Docker 或 npx 部署可通过
-          {" "}
-          <code>VIDEO_SUM_ACCESS_TOKEN</code>
-          {" "}
-          配置。
-        </p>
+        {setupRequired ? <p className="auth-muted">已有知识库数据将归属首个管理员。其他旧用户可由管理员设置密码后登录。</p> : null}
         <form className="auth-form" onSubmit={onSubmit}>
-          <label htmlFor="access-token">访问密钥</label>
+          <label htmlFor="account-name">用户名</label>
           <input
-            id="access-token"
-            type="password"
-            value={token}
-            autoComplete="current-password"
+            id="account-name" type="text" value={name} autoComplete="username"
             autoFocus
-            onChange={(event) => onTokenChange(event.target.value)}
+            onChange={(event) => onNameChange(event.target.value)}
           />
+          <label htmlFor="account-password">密码</label>
+          <input id="account-password" type="password" value={password} minLength={setupRequired ? 8 : undefined}
+            autoComplete={setupRequired ? "new-password" : "current-password"}
+            onChange={(event) => onPasswordChange(event.target.value)} />
+          {setupRequired && !desktop ? <>
+            <label htmlFor="access-token">服务访问密钥（仅首次设置）</label>
+            <input id="access-token" type="password" value={token} autoComplete="off"
+              onChange={(event) => onTokenChange(event.target.value)} />
+          </> : null}
           {error ? <p className="auth-error">{error}</p> : null}
           <button type="submit" disabled={submitting}>
-            {submitting ? "正在验证..." : "进入 BiliSum"}
+            {submitting ? "正在验证..." : setupRequired ? "创建管理员" : "登录"}
           </button>
         </form>
       </section>

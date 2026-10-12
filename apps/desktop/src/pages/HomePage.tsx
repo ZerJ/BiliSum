@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ClipboardEvent, type CSSProperties, type DragEvent, type FormEvent, type MouseEvent } from "react";
 
 import { api } from "../api";
+import { GenerationChat } from "../components/GenerationChat";
 import type { ConfigHealth } from "../appModel";
 import { platformLabel } from "../appModel";
 import { LinkIcon, LocalVideoIcon } from "../components/AppIcons";
@@ -12,11 +13,12 @@ import { formatDuration } from "../utils";
 
 type HomePageProps = {
   configHealth: ConfigHealth;
+  canConfigure: boolean;
   probePreview: VideoAssetSummary | null;
   probeUrl: string;
   setProbeUrl(value: string): void;
   submitStatus: string;
-  onProbe(event: FormEvent): Promise<void>;
+  onProbe(event: FormEvent, source?: string): Promise<boolean>;
   onImportLocalVideo(): Promise<void>;
   onImportLocalFiles(files: File[]): Promise<void>;
   onImportLocalPaths(paths: string[]): Promise<void>;
@@ -122,6 +124,7 @@ function isSupportedLocalMediaPath(path: string) {
 
 export function HomePage({
   configHealth,
+  canConfigure,
   probePreview,
   probeUrl,
   setProbeUrl,
@@ -162,6 +165,7 @@ export function HomePage({
   const [isDragActive, setIsDragActive] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [batchUploading, setBatchUploading] = useState(false);
+  const [conversationMode, setConversationMode] = useState(false);
 
   useEffect(() => {
     window.localStorage.setItem(SUMMARY_PREFERENCE_STORAGE_KEY, JSON.stringify(summaryPreference));
@@ -479,7 +483,17 @@ export function HomePage({
       <FloatingNoticeStack notices={[{ id: "home-submit-status", message: submitStatus }]} />
       <div className="section">
         <h2 className="section-title">开始总结</h2>
-        <form className="task-form" onSubmit={onProbe} onPaste={handlePaste}>
+        <div className="generation-entry-modes" role="group" aria-label="生成方式">
+          <button type="button" className={conversationMode ? "secondary-button" : "primary-button"} aria-pressed={!conversationMode} onClick={() => setConversationMode(false)}>快速生成</button>
+          <button type="button" className={conversationMode ? "primary-button" : "secondary-button"} aria-pressed={conversationMode} onClick={() => setConversationMode(true)}>对话式生成</button>
+        </div>
+        {conversationMode && <GenerationChat onStart={async (event, source, preference) => {
+          window.localStorage.setItem(SUMMARY_PREFERENCE_STORAGE_KEY, JSON.stringify(preference));
+          setSummaryPreference(preference);
+          setProbeUrl(source);
+          return onProbe(event, source);
+        }} />}
+        <form className="task-form" style={conversationMode ? { display: "none" } : undefined} onSubmit={onProbe} onPaste={handlePaste}>
           <div className="task-form-row">
             <label className="input-row input-row-hero" style={{ flex: 1 }}>
               <div
@@ -498,7 +512,7 @@ export function HomePage({
                   type="text"
                   value={probeUrl}
                   onChange={(event) => setProbeUrl(event.target.value)}
-                  placeholder="粘贴 Bilibili / YouTube 链接、BV 号，或粘贴/拖入本地媒体文件"
+                  placeholder="粘贴 Bilibili / YouTube / 抖音链接、BV 号，或粘贴/拖入本地媒体文件"
                   required
                 />
                 {canImportLocalVideo ? (
@@ -581,12 +595,12 @@ export function HomePage({
                     <span>生成导图</span>
                   </label>
                   <div className="summary-preference-divider" />
-                  <div className="summary-preference-group summary-prompt-group" onContextMenu={openPromptContextMenu}>
+                  <div className="summary-preference-group summary-prompt-group" onContextMenu={canConfigure ? openPromptContextMenu : undefined}>
                     <div className="summary-preference-label-row">
                       <span className="summary-preference-label">摘要 Prompt</span>
                       <span className="helper-chip">模式 {promptModeLabel}</span>
                     </div>
-                    <div className="home-prompt-mode" role="group" aria-label="Prompt 模式选择">
+                    {canConfigure ? <div className="home-prompt-mode" role="group" aria-label="Prompt 模式选择">
                       <button
                         className={`home-prompt-mode-option ${promptRouterMode !== "auto" ? "is-active" : ""}`}
                         type="button"
@@ -603,7 +617,7 @@ export function HomePage({
                       >
                         AI 识别场景
                       </button>
-                    </div>
+                    </div> : null}
                     <div className="home-prompt-select-shell">
                       <button
                         className="select-field home-prompt-select"
@@ -645,7 +659,7 @@ export function HomePage({
             </div>
           </div>
         </form>
-        {promptContextMenu ? (
+        {canConfigure && promptContextMenu ? (
           <div
             className="home-prompt-context-menu"
             ref={promptMenuRef}
@@ -687,7 +701,7 @@ export function HomePage({
           </div>
         ) : null}
 
-        {configHealth.checked && !configHealth.isConfigured ? (
+        {canConfigure && configHealth.checked && !configHealth.isConfigured ? (
           <article className={`config-alert-card tone-${configHealth.state}`}>
             <div className="config-alert-copy">
               <span className="section-kicker">运行配置提醒</span>

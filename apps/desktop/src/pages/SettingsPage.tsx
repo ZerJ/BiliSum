@@ -19,6 +19,8 @@ import { api } from "../api";
 import { SearchIcon } from "../components/AppIcons";
 import { FloatingNoticeStack } from "../components/FloatingNoticeStack";
 import { DependencyTree } from "../components/DependencyTree";
+import { DouyinLoginDialog } from "../components/DouyinLoginDialog";
+import type { BilibiliCookieCaptureResponse } from "../api";
 import type { EnvironmentInfo, PromptPreset, PromptPresetCreateRequest, RuntimeStatus, ServiceSettings, StorageLocationKind, StorageDirectoryStat, StorageOverview, TaskSummary } from "../types";
 
 import { formatDateTime, taskStatusLabel } from "../utils";
@@ -224,7 +226,7 @@ const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
   { category: "performance", targetKey: "runtime_channel", title: "运行环境通道", description: "选择基础版或 GPU 运行环境。", keywords: ["runtime", "运行环境", "gpu", "base"] },
   { category: "video", targetKey: "preserve_temp_audio", title: "保留临时音频", description: "控制是否保留转写中间音频。", keywords: ["音频", "临时", "preserve", "temp"] },
   { category: "video", targetKey: "enable_cache", title: "启用缓存", description: "控制任务缓存行为。", keywords: ["缓存", "cache"] },
-  { category: "video", targetKey: "ytdlp_cookies_file", title: "yt-dlp Cookies 文件", description: "配置 B 站登录态 cookies.txt。", keywords: ["cookie", "cookies", "b站", "登录", "风控", "412"] },
+  { category: "video", targetKey: "ytdlp_cookies_file", title: "站点 Cookies 文件", description: "配置 B 站或抖音登录态 cookies.txt。", keywords: ["cookie", "cookies", "b站", "抖音", "登录", "风控", "412"] },
   { category: "runtime", targetKey: "runtime_status", title: "运行环境状态", description: "检查 Python、Torch、CUDA 与扩展依赖。", keywords: ["运行环境", "环境", "torch", "python", "cuda"] },
   { category: "runtime", targetKey: "local_asr_runtime", title: "本地 ASR 运行环境", description: "安装或检查本地 ASR 依赖。", keywords: ["本地", "asr", "whisper", "安装"] },
   { category: "runtime", targetKey: "funasr_runtime", title: "FunASR 运行环境", description: "安装或检查 FunASR 依赖（中文效果优于 Whisper）。", keywords: ["funasr", "qwen", "asr", "安装", "中文"] },
@@ -389,6 +391,8 @@ export function SettingsPage({
   const [funasrOutput, setFunasrOutput] = useState("");
   const [funasrInstalling, setFunasrInstalling] = useState(false);
   const [bilibiliCookieCapturing, setBilibiliCookieCapturing] = useState(false);
+  const [douyinCookieCapturing, setDouyinCookieCapturing] = useState(false);
+  const [douyinLoginDialogOpen, setDouyinLoginDialogOpen] = useState(false);
   const [bilibiliCookieStatus, setBilibiliCookieStatus] = useState("");
   const [bilibiliQrcodeKey, setBilibiliQrcodeKey] = useState("");
   const [bilibiliQrcodeImage, setBilibiliQrcodeImage] = useState("");
@@ -1885,6 +1889,39 @@ export function SettingsPage({
     }
   }
 
+  async function captureDouyinLoginCookies() {
+    if (!form || douyinCookieCapturing || bilibiliCookieCapturing) {
+      return;
+    }
+    if (!window.desktop?.douyin) {
+      setDouyinLoginDialogOpen(true);
+      return;
+    }
+    try {
+      setDouyinCookieCapturing(true);
+      const desktopDouyin = window.desktop.douyin;
+      setBilibiliCookieStatus("请在新窗口登录抖音，登录成功后会自动保存 Cookies...");
+      const captured: BilibiliCookieCaptureResult = await desktopDouyin.captureLoginCookies();
+      await saveDouyinLoginCookies(captured);
+    } catch (error) {
+      setBilibiliCookieStatus(error instanceof Error ? error.message : "捕获抖音登录态失败，请重新登录。");
+    } finally {
+      setDouyinCookieCapturing(false);
+    }
+  }
+
+  async function saveDouyinLoginCookies(captured: BilibiliCookieCaptureResponse) {
+    const response = await api.updateSettings({
+      ytdlp_cookies_file: captured.cookiesFile,
+      ytdlp_cookies_browser: "",
+    });
+    setForm(maskConfiguredApiKeys(response.settings));
+    setIsDirty(false);
+    setSaveStatus(response.message || "设置已保存");
+    setBilibiliCookieStatus(`抖音登录态已保存，捕获 ${captured.cookieCount} 条 Cookies。`);
+    onSettingsSaved(response.settings, environment);
+  }
+
   function buildLlmTestPayload(scope: GenerationModelScope) {
     if (!form) {
       return null;
@@ -2714,14 +2751,14 @@ export function SettingsPage({
             <section className="settings-category-section">
               <header className="settings-category-header">
                 <h2>视频获取</h2>
-                <p>处理 B 站登录态、下载缓存和转写临时音频。遇到风控、登录或重复下载问题时先看这里。</p>
+                <p>处理 B 站/抖音登录态、下载缓存和转写临时音频。遇到风控、登录或重复下载问题时先看这里。</p>
               </header>
               <div className="settings-form-group">
                 <label
                   className={`settings-input-group settings-focus-target ${activeFocusTarget === "ytdlp_cookies_file" ? "is-highlighted" : ""}`}
                   ref={registerFocusTarget("ytdlp_cookies_file") as (node: HTMLLabelElement | null) => void}
                 >
-                  <span className="settings-input-label">B 站 Cookies 文件</span>
+                  <span className="settings-input-label">B 站 / 抖音 Cookies 文件</span>
                   <div className="settings-input-action-row">
                     <input
                       className="settings-input-field"
@@ -2732,13 +2769,21 @@ export function SettingsPage({
                     <button
                       className="secondary-button"
                       type="button"
-                      disabled={bilibiliCookieCapturing}
+                      disabled={bilibiliCookieCapturing || douyinCookieCapturing}
                       onClick={() => void captureBilibiliLoginCookies()}
                     >
-                      {bilibiliCookieCapturing ? "获取中..." : "登录获取"}
+                      {bilibiliCookieCapturing ? "获取中..." : "B站登录"}
+                    </button>
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      disabled={bilibiliCookieCapturing || douyinCookieCapturing}
+                      onClick={() => void captureDouyinLoginCookies()}
+                    >
+                      {douyinCookieCapturing ? "获取中..." : "抖音登录"}
                     </button>
                   </div>
-                  <span className="settings-input-caption">推荐通过提示弹窗打开 B 站登录窗口自动生成；也可以手动填写从已登录浏览器导出的 cookies.txt。</span>
+                  <span className="settings-input-caption">{window.desktop ? "桌面版会打开独立登录窗口。" : "网页版 B 站支持扫码，抖音支持登录后上传 cookies.txt 或粘贴 Cookie。"}两站登录态会合并保存。</span>
                   {bilibiliQrcodeImage ? (
                     <div className="settings-cookie-qrcode">
                       <img src={bilibiliQrcodeImage} alt="B 站扫码登录二维码" />
@@ -5158,6 +5203,7 @@ export function SettingsPage({
           </section>
         </div>
       ) : null}
+      <DouyinLoginDialog isOpen={douyinLoginDialogOpen} onClose={() => setDouyinLoginDialogOpen(false)} onCookiesCaptured={saveDouyinLoginCookies} />
       {taskListOpen ? (
         <div className="settings-tasklist-float" role="dialog" aria-modal="false" aria-label="最近任务列表" onClick={() => setTaskListOpen(false)}>
           <div className="settings-tasklist-panel" onClick={(event) => event.stopPropagation()}>

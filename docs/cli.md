@@ -2,6 +2,16 @@
 
 `bilisum` 是 BiliSum 的命令行控制面：**既可以直接控制已安装的 BiliSum（桌面端 / 已运行的服务），也可以完全独立运行**（自带运行时与配置），让 Agent / 脚本做视频理解（转写 + 摘要），不打开浏览器。
 
+> 启用多人账户后，旧访问密钥只用于首次设置管理员，不再能调用业务 API。CLI 需设置 `BILISUM_USERNAME` 和 `BILISUM_PASSWORD`；服务配置由管理员在网页端统一维护，普通用户无需重复配置。
+
+```powershell
+$env:BILISUM_USERNAME = "你的用户名"
+$env:BILISUM_PASSWORD = "你的密码"
+bilisum tasks
+```
+
+CLI 每次运行只在内存中使用账户会话，不保存密码。`bilisum --setting` 会打开浏览器，网页仍需自行登录管理员账户。不要把密码写入版本库或共享脚本。
+
 ## 安装
 
 ```bash
@@ -47,6 +57,22 @@ bilisum summarize "https://www.bilibili.com/video/BV1xxxx"   # 开跑
 
 ## 快速开始
 
+### 通过对话选择生成形式
+
+```bash
+bilisum chat
+bilisum chat "https://www.bilibili.com/video/BV1xx411c7mD"
+bilisum "https://www.bilibili.com/video/BV1xx411c7mD"
+```
+
+发送链接后，按提示选择文字笔记、图文笔记、快速摘要或转写全文，再选择 Markdown / JSON（转写默认纯文本）和保存路径，确认后才启动任务。可以输入编号或选项名称；输入 `q`、`退出`、`取消` 或按 Ctrl+C 退出。任务结束后可以继续发送下一个链接。这里是逐步引导式对话，无需额外配置聊天模型。
+
+`chat` 支持现有任务选项，例如 `--all-pages`、`--page 2`、`--environment desktop`、`--output notes.md`。多 P 视频需要通过 `--page` 或 `--all-pages` 指定处理范围。显式的 `--format` 和 `--output` 会跳过对应提问。对话模式需要交互终端；脚本和 Agent 仍使用下面的命令。
+
+桌面端 / 网页首页也可切换到「对话式生成」：发送链接，选择文字或图文笔记，确认生成；检测到合集或多 P 时继续选择范围。生成后在详情页阅读并导出 Markdown / Obsidian 笔记。
+
+### 直接执行任务
+
 ```bash
 # 摘要一个视频（默认输出：元数据 + 知识笔记，不含字幕）
 bilisum summarize "https://www.bilibili.com/video/BV1xxxx"
@@ -74,6 +100,7 @@ bilisum summarize --help
 
 | 命令 | 说明 |
 |------|------|
+| `bilisum chat [url\|file]` / `bilisum <url>` | 对话选择内容形式、输出格式和保存路径，确认后生成 |
 | `bilisum summarize <url\|file>` | 完整摘要：转写 → 摘要 → 知识笔记（默认输出笔记） |
 | `bilisum brief <url\|file>` | 快速摘要卡片：只生成摘要（overview + 要点 + 章节），**跳过知识笔记 LLM 调用**，速度更快 |
 | `bilisum transcribe <url\|file>` | 输出转写全文（任务仍会顺带生成摘要） |
@@ -138,7 +165,7 @@ bilisum --setting          # 打开当前环境的设置页
 |------|------|
 | `--host <host>` / `--port <port>` | 服务地址（显式指定 = custom 连接） |
 | `--data <path>` | 数据根目录（默认随环境） |
-| `--token <token>` | 访问令牌（默认随环境） |
+| `--token <token>` | 服务访问密钥（仅首次设置前可用于业务 API） |
 | `--environment <name>` | 单次覆盖环境：`desktop` / `cli` / `custom` / `auto` |
 | `--env KEY=VALUE` | 为 CLI 拉起的服务附加环境变量 |
 | `--page <n>` / `--all-pages` | 多 P 视频分 P 选择 |
@@ -211,6 +238,7 @@ CLI 侧（shell 环境变量）：
 | `BILISUM_DATA_ROOT` / `BILISUM_DATA` | 桌面端数据根覆盖 | 桌面端数据根 |
 | `BILISUM_CLI_HOME` | CLI 独立环境的数据根（cli 模式） | `%LOCALAPPDATA%\BiliSum\cli` / `~/.bilisum` |
 | `BILISUM_TOKEN` | 访问令牌 | 自动获取 |
+| `BILISUM_USERNAME` / `BILISUM_PASSWORD` | 启用多人账户后的 CLI 登录凭据 | 未设置 |
 | `BILISUM_PYTHON` | 指定 Python 可执行文件 | 自动查找 |
 | `BILISUM_CLI_IDLE_TIMEOUT` | 后台服务空闲自动关闭秒数 | `600` |
 
@@ -238,3 +266,5 @@ CLI 连接的是 HTTP 服务，`docker run -p 3838:3838 ...` 后：
 ```bash
 bilisum summarize "https://..." --host 127.0.0.1 --port 3838 --token <容器内设置的 VIDEO_SUM_ACCESS_TOKEN>
 ```
+
+管理员完成首次账户设置后，在当前 shell 配置 `BILISUM_USERNAME` / `BILISUM_PASSWORD`，再运行同一命令；这时 `--token` 不能代替个人登录。

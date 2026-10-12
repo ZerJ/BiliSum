@@ -32,6 +32,7 @@ video-sum-service = { workspace = true }
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["packages/core/src/video_sum_core/_vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]

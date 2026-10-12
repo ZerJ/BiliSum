@@ -12,7 +12,7 @@ from video_sum_core.utils import normalize_video_url
 from video_sum_infra.config import ServiceSettings
 from video_sum_service.knowledge.local_llm import chat_knowledge_llm, knowledge_llm_available, parse_json_payload
 from video_sum_service.knowledge.rag_service import RagService
-from video_sum_service.repository import SqliteTaskRepository
+from video_sum_service.repository import DEFAULT_KNOWLEDGE_USER_ID, SqliteTaskRepository
 from video_sum_service.runtime_startup import submit_task_or_queue
 from video_sum_service.schemas import (
     KnowledgeConversationMessagesResponse,
@@ -34,23 +34,42 @@ _MAX_REASONING = 4000
 logger = logging.getLogger("video_sum_service.knowledge.conversation")
 
 
-def _model_or_404(repository: SqliteTaskRepository, conversation_id: str) -> KnowledgeConversationResponse:
-    payload = repository.get_knowledge_conversation(conversation_id)
+def _model_or_404(
+    repository: SqliteTaskRepository,
+    conversation_id: str,
+    user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+) -> KnowledgeConversationResponse:
+    payload = repository.get_knowledge_conversation(conversation_id, user_id)
     if payload is None:
         raise HTTPException(status_code=404, detail="会话不存在。")
     return KnowledgeConversationResponse.model_validate(payload)
 
 
-def list_conversations(repository: SqliteTaskRepository, limit: int = 50) -> list[KnowledgeConversationResponse]:
-    return [KnowledgeConversationResponse.model_validate(item) for item in repository.list_knowledge_conversations(limit)]
+def list_conversations(
+    repository: SqliteTaskRepository,
+    limit: int = 50,
+    user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+) -> list[KnowledgeConversationResponse]:
+    return [
+        KnowledgeConversationResponse.model_validate(item)
+        for item in repository.list_knowledge_conversations(limit, user_id)
+    ]
 
 
-def get_conversation(repository: SqliteTaskRepository, conversation_id: str) -> KnowledgeConversationResponse:
-    return _model_or_404(repository, conversation_id)
+def get_conversation(
+    repository: SqliteTaskRepository,
+    conversation_id: str,
+    user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+) -> KnowledgeConversationResponse:
+    return _model_or_404(repository, conversation_id, user_id)
 
 
-def get_messages(repository: SqliteTaskRepository, conversation_id: str) -> KnowledgeConversationMessagesResponse:
-    _model_or_404(repository, conversation_id)
+def get_messages(
+    repository: SqliteTaskRepository,
+    conversation_id: str,
+    user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+) -> KnowledgeConversationMessagesResponse:
+    _model_or_404(repository, conversation_id, user_id)
     return KnowledgeConversationMessagesResponse(
         conversation_id=conversation_id,
         messages=[KnowledgeMessageResponse.model_validate(item) for item in repository.list_knowledge_messages(conversation_id)],
@@ -84,8 +103,12 @@ def _job_item(item: dict[str, object]) -> KnowledgeJobItemResponse:
     )
 
 
-def get_job(repository: SqliteTaskRepository, job_id: str) -> KnowledgeJobResponse:
-    payload = repository.get_knowledge_job(job_id)
+def get_job(
+    repository: SqliteTaskRepository,
+    job_id: str,
+    user_id: str | None = None,
+) -> KnowledgeJobResponse:
+    payload = repository.get_knowledge_job(job_id, user_id)
     if payload is None:
         raise HTTPException(status_code=404, detail="任务不存在。")
     items = [_job_item(item) for item in payload.get("items", []) if isinstance(item, dict)]
@@ -113,10 +136,16 @@ def get_job(repository: SqliteTaskRepository, job_id: str) -> KnowledgeJobRespon
     )
 
 
-def search_references(repository: SqliteTaskRepository, query: str = "", limit: int = 12) -> KnowledgeReferencesResponse:
+def search_references(
+    repository: SqliteTaskRepository,
+    query: str = "",
+    limit: int = 12,
+    user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+) -> KnowledgeReferencesResponse:
     cleaned = str(query or "").strip().lower()
     items = []
-    for video in repository.list_video_assets():
+    allowed_video_ids = repository.list_knowledge_content_ids(user_id, "video")
+    for video in repository.list_knowledge_video_assets(user_id):
         if cleaned and cleaned not in video.title.lower():
             continue
         items.append({
@@ -128,13 +157,18 @@ def search_references(repository: SqliteTaskRepository, query: str = "", limit: 
             "updated_at": video.last_summary_at or video.updated_at,
         })
     for folder in repository.list_video_folders():
+        folder_video_ids = allowed_video_ids & set(
+            repository.list_video_ids_in_folder(folder.folder_id)
+        )
+        if not folder_video_ids:
+            continue
         if cleaned and cleaned not in folder.name.lower():
             continue
         items.append({
             "kind": "folder",
             "id": folder.folder_id,
             "label": folder.name,
-            "subtitle": f"{len(repository.list_video_ids_in_folder(folder.folder_id))} 个视频",
+            "subtitle": f"{len(folder_video_ids)} 个视频",
             "updated_at": folder.updated_at,
         })
     items.sort(key=lambda item: item["updated_at"], reverse=True)
@@ -172,15 +206,21 @@ def _create_video_tasks(
     repository: SqliteTaskRepository,
     query: str,
     references: list[KnowledgeReference],
+    user_id: str,
 ) -> tuple[list[tuple[str, str | None, int]], list[str]]:
     urls = _extract_urls(query)
+    allowed_video_ids = repository.list_knowledge_content_ids(user_id, "video")
     for reference in references:
         if reference.kind == "video":
+            if reference.id not in allowed_video_ids:
+                continue
             video = repository.get_video_asset(reference.id)
             if video is not None and video.source_url not in urls:
                 urls.append(video.source_url)
         elif reference.kind == "folder":
             for video_id in repository.list_video_ids_in_folder(reference.id):
+                if video_id not in allowed_video_ids:
+                    continue
                 video = repository.get_video_asset(video_id)
                 if video is not None and video.source_url not in urls:
                     urls.append(video.source_url)
@@ -189,7 +229,15 @@ def _create_video_tasks(
     for position, url in enumerate(urls[:_MAX_TASK_LINKS]):
         try:
             probed, _pages, _requires_selection = probe_video_asset(url)
-            asset = repository.upsert_video_asset(probed)
+            asset = repository.upsert_video_asset(
+                probed,
+                knowledge_user_id=user_id,
+            )
+            repository.set_knowledge_content_membership(
+                user_id,
+                [("video", asset.video_id)],
+                True,
+            )
             normalized = normalize_video_url(url)
             record = repository.create_task(
                 TaskInput(input_type=InputType.URL, source=normalized.normalized_url, title=asset.title, platform_hint=asset.platform),
@@ -204,21 +252,35 @@ def _create_video_tasks(
     return task_items, errors
 
 
-def _suggestion_facts(repository: SqliteTaskRepository) -> tuple[str, list[str]]:
-    videos = repository.list_video_assets()
+def _suggestion_facts(
+    repository: SqliteTaskRepository,
+    user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+) -> tuple[str, list[str]]:
+    videos = repository.list_knowledge_video_assets(user_id)
     recent = sorted(
         [video for video in videos if video.last_summary_at is not None],
         key=lambda video: video.last_summary_at or video.updated_at,
         reverse=True,
     )[:6]
-    folders = repository.list_video_folders()[:8]
-    tags = [str(tag.get("tag") or "").strip() for tag in repository.list_all_tags()[:12]]
+    video_ids = {video.video_id for video in videos}
+    folders = [
+        folder
+        for folder in repository.list_video_folders()
+        if video_ids & set(repository.list_video_ids_in_folder(folder.folder_id))
+    ][:8]
+    tags = [
+        str(tag.get("tag") or "").strip()
+        for tag in repository.list_all_tags(user_id)[:12]
+    ]
     tags = [tag for tag in tags if tag]
     facts = "\n".join(
         [
             "最近总结视频：" + "、".join(video.title for video in recent),
             "收藏视频：" + "、".join(video.title for video in videos if video.is_favorite)[:600],
-            "收藏夹：" + "、".join(f"{folder.name}({len(repository.list_video_ids_in_folder(folder.folder_id))})" for folder in folders),
+            "收藏夹：" + "、".join(
+                f"{folder.name}({len(video_ids & set(repository.list_video_ids_in_folder(folder.folder_id)))})"
+                for folder in folders
+            ),
             "标签：" + "、".join(tags),
         ]
     )
@@ -226,9 +288,13 @@ def _suggestion_facts(repository: SqliteTaskRepository) -> tuple[str, list[str]]
     return facts, based_on
 
 
-def get_suggestions(repository: SqliteTaskRepository, settings: ServiceSettings) -> KnowledgeSuggestionsResponse:
+def get_suggestions(
+    repository: SqliteTaskRepository,
+    settings: ServiceSettings,
+    user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+) -> KnowledgeSuggestionsResponse:
     try:
-        facts, based_on = _suggestion_facts(repository)
+        facts, based_on = _suggestion_facts(repository, user_id)
     except Exception:
         logger.exception("knowledge suggestion facts collection failed; using local fallback")
         facts, based_on = "当前没有可读取的个性化推荐上下文。", []
@@ -277,8 +343,9 @@ def stream_conversation(
     references: list[KnowledgeReference],
     should_cancel: Callable[[], bool],
     coordinator_submit: Callable[[str], None],
+    user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
 ) -> Iterator[tuple[str, dict[str, object]]]:
-    conversation = _model_or_404(repository, conversation_id)
+    conversation = _model_or_404(repository, conversation_id, user_id)
     clean_query = str(query or "").strip()
     if not clean_query:
         raise HTTPException(status_code=400, detail="问题不能为空。")
@@ -305,7 +372,13 @@ def stream_conversation(
     yield ("message", {"user_message_id": user["message_id"], "assistant_message_id": assistant_id})
     if _is_task_request(clean_query, references):
         yield ("tool", {"id": "task_router", "label": "任务路由", "status": "running", "detail": "已识别为多视频总结任务，正在创建子任务。"})
-        items, errors = _create_video_tasks(app_state, repository, clean_query, references)
+        items, errors = _create_video_tasks(
+            app_state,
+            repository,
+            clean_query,
+            references,
+            user_id,
+        )
         if not items:
             detail = "；".join(errors) or "没有识别到可执行的视频链接。"
             repository.update_knowledge_message(assistant_id, content=f"视频任务创建失败：{detail}", status="error", tools=[{"id": "task_router", "label": "任务路由", "status": "error", "detail": detail}])
@@ -338,7 +411,16 @@ def stream_conversation(
         if errors:
             repository.update_knowledge_job(str(job["job_id"]), status="running", error_message="；".join(errors))
         yield ("tool", {"id": "task_router", "label": "任务路由", "status": "completed", "detail": f"已创建 {len(items)} 个视频总结子任务。"})
-        yield ("job", {"job": get_job(repository, str(job["job_id"])).model_dump(mode="json")})
+        yield (
+            "job",
+            {
+                "job": get_job(
+                    repository,
+                    str(job["job_id"]),
+                    user_id,
+                ).model_dump(mode="json")
+            },
+        )
         yield ("done", {"query": clean_query, "answer": "任务已创建。所有视频完成后，我会继续生成聚合 Markdown 文档。", "sources": [], "job_id": job["job_id"]})
         return
 

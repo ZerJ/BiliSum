@@ -105,6 +105,9 @@ type DesktopBridge = {
   bilibili: {
     captureLoginCookies(): Promise<BilibiliCookieExportResult>;
   };
+  douyin: {
+    captureLoginCookies(): Promise<BilibiliCookieExportResult>;
+  };
   shell: {
     openPath(targetPath: string): Promise<string>;
   };

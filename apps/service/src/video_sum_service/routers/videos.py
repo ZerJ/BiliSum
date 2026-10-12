@@ -1098,18 +1098,27 @@ def get_local_video_media(video_id: str, request: Request) -> FileResponse:
     video = task_store.get_video_asset(video_id)
     if video is None:
         raise HTTPException(status_code=404, detail="Video not found.")
-    if str(video.platform or "").lower() != "local":
-        raise HTTPException(status_code=400, detail="当前视频不支持本地播放器。")
 
-    source_path = Path(str(video.source_url or "")).expanduser()
-    try:
-        resolved_path = source_path.resolve()
-    except OSError:
-        resolved_path = source_path
-    if not resolved_path.exists() or not resolved_path.is_file():
-        raise HTTPException(status_code=404, detail="本地视频文件不存在或已被移动。")
-    if not is_supported_local_media_file(resolved_path):
-        raise HTTPException(status_code=400, detail="当前文件类型不支持本地播放器。")
+    platform = str(video.platform or "").lower()
+    if platform == "local":
+        source_path = Path(str(video.source_url or "")).expanduser()
+        try:
+            resolved_path = source_path.resolve()
+        except OSError:
+            resolved_path = source_path
+        if not resolved_path.exists() or not resolved_path.is_file():
+            raise HTTPException(status_code=404, detail="本地视频文件不存在或已被移动。")
+        if not is_supported_local_media_file(resolved_path):
+            raise HTTPException(status_code=400, detail="当前文件类型不支持本地播放器。")
+    elif platform == "douyin":
+        resolved_path = _resolve_douyin_cached_media(task_store, video_id)
+        if resolved_path is None:
+            raise HTTPException(
+                status_code=404,
+                detail="抖音视频缓存尚未生成，请先完成一次摘要任务。",
+            )
+    else:
+        raise HTTPException(status_code=400, detail="当前视频不支持本地播放器。")
 
     media_type = None
     suffix = resolved_path.suffix.lower()
@@ -1124,6 +1133,19 @@ def get_local_video_media(video_id: str, request: Request) -> FileResponse:
     elif suffix == ".mp3":
         media_type = "audio/mpeg"
     return FileResponse(resolved_path, media_type=media_type, filename=resolved_path.name)
+
+
+def _resolve_douyin_cached_media(task_store: SqliteTaskRepository, video_id: str) -> Path | None:
+    tasks_dir = settings_manager.current.tasks_dir.resolve()
+    for task in task_store.list_tasks_for_video(video_id):
+        task_dir = (tasks_dir / task.task_id).resolve()
+        if task_dir.parent != tasks_dir:
+            continue
+        for relative_path in (Path("source.douyin.mp4"), Path("visual_evidence/source.visual.mp4")):
+            candidate = task_dir / relative_path
+            if candidate.exists() and candidate.is_file():
+                return candidate
+    return None
 
 
 @router.delete("/{video_id}")
@@ -1301,6 +1323,7 @@ def create_video_tasks_batch(video_id: str, body: VideoTaskBatchRequest, request
             video=video,
             page_number=page_number,
             prompt_preset_id=prompt_preset_id,
+            visual_note_mode=getattr(body, "visual_note_mode", None),
         )
         created_tasks.append(refreshed.to_detail())
 

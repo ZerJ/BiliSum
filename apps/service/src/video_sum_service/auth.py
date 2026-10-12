@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
 import json
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
+from time import monotonic
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
 ACCESS_TOKEN_ENV = "VIDEO_SUM_ACCESS_TOKEN"
 SESSION_COOKIE_NAME = "bilisum_session"
+ACCOUNT_COOKIE_NAME = "bilisum_account"
+ACCOUNT_SESSION_DAYS = 14
+PASSWORD_ITERATIONS = 600_000
+_login_failures: dict[tuple[str, str], list[float]] = {}
+_login_lock = Lock()
 
 
 class AccessTokenManager:
@@ -76,7 +84,7 @@ def extract_bearer_token(request: Request) -> str | None:
 
 
 def is_auth_exempt_path(path: str, method: str = "GET") -> bool:
-    if path in {"/health", "/api/v1/auth/status", "/api/v1/auth/session"}:
+    if path in {"/health", "/api/v1/auth/status", "/api/v1/auth/session", "/api/v1/auth/setup", "/api/v1/auth/login", "/api/v1/auth/logout"}:
         return True
     if path == "/" or path.startswith("/static/") or path.startswith("/media/"):
         return True
@@ -92,6 +100,9 @@ def is_auth_exempt_path(path: str, method: str = "GET") -> bool:
 
 
 def request_is_authorized(request: Request, manager: AccessTokenManager) -> bool:
+    repository = getattr(request.app.state, "task_repository", None)
+    if repository is not None and repository.accounts_enabled():
+        return account_from_request(request) is not None
     bearer = extract_bearer_token(request)
     if manager.verify(bearer):
         return True
@@ -102,7 +113,7 @@ def request_is_authorized(request: Request, manager: AccessTokenManager) -> bool
 def unauthorized_response() -> JSONResponse:
     return JSONResponse(
         status_code=401,
-        content={"detail": "需要输入 BiliSum 访问密钥。"},
+        content={"detail": "请登录 BiliSum 账户。"},
         headers={"WWW-Authenticate": "Bearer"},
     )
 
@@ -130,3 +141,79 @@ def describe_token_source(manager: AccessTokenManager) -> dict[str, object]:
         "configuredFromEnv": manager.is_configured_from_env(),
         "tokenFile": str(manager.token_file),
     }
+
+
+def hash_password(password: str) -> str:
+    if not 8 <= len(password) <= 256:
+        raise ValueError("密码长度需为 8 到 256 个字符。")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def login_attempt_allowed(ip: str, name: str) -> bool:
+    key = (ip, name.casefold())
+    now = monotonic()
+    with _login_lock:
+        recent = [attempt for attempt in _login_failures.get(key, []) if now - attempt < 300]
+        if recent:
+            _login_failures[key] = recent
+        else:
+            _login_failures.pop(key, None)
+        return len(recent) < 10
+
+
+def record_login_attempt(ip: str, name: str, *, succeeded: bool) -> None:
+    key = (ip, name.casefold())
+    with _login_lock:
+        if succeeded:
+            _login_failures.pop(key, None)
+        else:
+            if len(_login_failures) > 1000:
+                cutoff = monotonic() - 300
+                for old_key in list(_login_failures):
+                    if not any(attempt >= cutoff for attempt in _login_failures[old_key]):
+                        _login_failures.pop(old_key, None)
+            _login_failures.setdefault(key, []).append(monotonic())
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, iterations, salt, expected = encoded.split("$")
+        if algorithm != "pbkdf2_sha256" or not 1 <= int(iterations) <= 1_000_000:
+            return False
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), int(iterations))
+        return hmac.compare_digest(digest, bytes.fromhex(expected))
+    except (ValueError, TypeError):
+        return False
+
+
+def session_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def account_from_request(request: Request) -> dict[str, object] | None:
+    repository = getattr(request.app.state, "task_repository", None)
+    token = request.cookies.get(ACCOUNT_COOKIE_NAME)
+    if repository is None or not token:
+        return None
+    return repository.get_account_session(session_hash(token))
+
+
+def require_account(request: Request, *, admin: bool = False) -> dict[str, object]:
+    account = account_from_request(request)
+    if account is None:
+        raise HTTPException(status_code=401, detail="请登录 BiliSum 账户。")
+    if admin and not account["is_admin"]:
+        raise HTTPException(status_code=403, detail="仅管理员可以管理账户。")
+    return account
+
+
+def create_account_session(request: Request, response: JSONResponse, user_id: str) -> None:
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.now(timezone.utc) + timedelta(days=ACCOUNT_SESSION_DAYS)).isoformat()
+    request.app.state.task_repository.create_account_session(user_id, session_hash(token), expires)
+    response.set_cookie(
+        ACCOUNT_COOKIE_NAME, token, httponly=True, samesite="strict",
+        secure=request.url.scheme == "https", path="/", max_age=ACCOUNT_SESSION_DAYS * 86400,
+    )

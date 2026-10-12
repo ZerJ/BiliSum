@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 
 import { api } from "../../api";
+import { LinkIcon } from "../../components/AppIcons";
+import { ArticleImportDialog } from "./ArticleImportDialog";
+import { ArticlesPanel } from "./ArticlesPanel";
+import { ClassificationPanel } from "./ClassificationPanel";
 import { AskPanel, type KnowledgeChatMessage } from "./AskPanel";
 import { SearchPanel } from "./SearchPanel";
 import { TagManager } from "./TagManager";
@@ -21,7 +25,7 @@ import type {
   KnowledgeTagItem,
 } from "../../types";
 
-type KnowledgeView = "chat" | "workspace";
+type KnowledgeView = "chat" | "workspace" | "articles" | "classification";
 
 function createMessage(
   role: "user" | "assistant",
@@ -68,11 +72,15 @@ function fromKnowledgeMessage(message: KnowledgeMessage): KnowledgeChatMessage {
   };
 }
 
-export function KnowledgePage() {
+export function KnowledgePage({ canConfigure = true }: { canConfigure?: boolean }) {
   const navigate = useNavigate();
+  const location = useLocation();
   const askAbortRef = useRef<AbortController | null>(null);
   const activeConversationIdRef = useRef<string | null>(null);
-  const [activeView, setActiveView] = useState<KnowledgeView>("chat");
+  const [activeView, setActiveView] = useState<KnowledgeView>(() => {
+    const view = new URLSearchParams(window.location.search).get("view");
+    return view === "workspace" || view === "articles" || view === "classification" ? view : "chat";
+  });
   const [stats, setStats] = useState<KnowledgeStatsResponse | null>(null);
   const [tags, setTags] = useState<KnowledgeTagItem[]>([]);
   const [network, setNetwork] = useState<KnowledgeNetworkResponse>({ nodes: [], links: [], selected_tags: [] });
@@ -96,10 +104,17 @@ export function KnowledgePage() {
   const [recentQueries, setRecentQueries] = useState<string[]>([]);
   const [asking, setAsking] = useState(false);
   const [askingConversationId, setAskingConversationId] = useState<string | null>(null);
-  const [status, setStatus] = useState("");
+  const [status, setStatusText] = useState("");
+  const [statusTone, setStatusTone] = useState<"danger" | "progress" | "success">("success");
+  function setStatus(message: string, tone: "danger" | "progress" | "success" = "success") {
+    setStatusText(message);
+    setStatusTone(tone);
+  }
   const [managingVideoId, setManagingVideoId] = useState<string | null>(null);
   const [maintenanceMenuOpen, setMaintenanceMenuOpen] = useState(false);
   const [maintenanceBusy, setMaintenanceBusy] = useState(false);
+  const [articleImportOpen, setArticleImportOpen] = useState(false);
+  const [articleRefreshToken, setArticleRefreshToken] = useState(0);
   const maintenanceMenuRef = useRef<HTMLDivElement | null>(null);
   const conversationMenuRef = useRef<HTMLDivElement | null>(null);
   const conversationMenuFirstItemRef = useRef<HTMLButtonElement | null>(null);
@@ -116,9 +131,9 @@ export function KnowledgePage() {
 
   const statsSummary = useMemo(() => ([
     { label: "视频", value: stats?.video_count ?? 0 },
+    { label: "文章", value: stats?.document_count ?? 0 },
     { label: "标签", value: stats?.tag_count ?? 0 },
     { label: "索引片段", value: stats?.indexed_chunk_count ?? 0 },
-    { label: "未标记", value: stats?.untagged_video_count ?? 0 },
   ]), [stats]);
 
   const activeConversation = useMemo(
@@ -129,11 +144,17 @@ export function KnowledgePage() {
   useEffect(() => {
     activeConversationIdRef.current = activeConversationId;
   }, [activeConversationId]);
-  const statusTone = /失败|错误|异常|HTTP\s*[45]\d\d/i.test(status)
-    ? "danger"
-    : /正在|处理中|维护中/.test(status)
-      ? "progress"
-      : "success";
+
+  useEffect(() => {
+    const view = new URLSearchParams(location.search).get("view");
+    setActiveView(view === "workspace" || view === "articles" || view === "classification" ? view : "chat");
+  }, [location.search]);
+
+  function selectView(view: KnowledgeView) {
+    setActiveView(view);
+    navigate(view === "chat" ? "/knowledge" : `/knowledge?view=${view}`, { replace: true });
+  }
+
 
   async function refreshBase(nextSelectedTags: string[] = selectedTags, expanded: boolean = networkExpanded) {
     const [tagPayload, networkPayload, statsPayload] = await Promise.all([
@@ -165,7 +186,7 @@ export function KnowledgePage() {
       ]);
       setSuggestions(payload.suggestions);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "刷新推荐问题失败");
+      setStatus(error instanceof Error ? error.message : "刷新推荐问题失败", "danger");
     } finally {
       setSuggestionsRefreshing(false);
     }
@@ -173,7 +194,7 @@ export function KnowledgePage() {
 
   useEffect(() => {
     void refreshBase().catch((error) => {
-      setStatus(error instanceof Error ? error.message : "知识库初始化失败");
+      setStatus(error instanceof Error ? error.message : "知识库初始化失败", "danger");
     });
   }, []);
 
@@ -200,7 +221,7 @@ export function KnowledgePage() {
       setActiveConversationId(target.conversation_id);
     }).catch((error) => {
       if (!cancelled) {
-        setStatus(error instanceof Error ? error.message : "会话初始化失败");
+        setStatus(error instanceof Error ? error.message : "会话初始化失败", "danger");
       }
     });
     return () => {
@@ -219,7 +240,7 @@ export function KnowledgePage() {
       }
     }).catch((error) => {
       if (!cancelled) {
-        setStatus(error instanceof Error ? error.message : "加载会话失败");
+        setStatus(error instanceof Error ? error.message : "加载会话失败", "danger");
       }
     });
     return () => {
@@ -286,7 +307,7 @@ export function KnowledgePage() {
 
   useEffect(() => {
     void refreshBase(selectedTags, networkExpanded).catch((error) => {
-      setStatus(error instanceof Error ? error.message : "刷新知识库概览失败");
+      setStatus(error instanceof Error ? error.message : "刷新知识库概览失败", "danger");
     });
   }, [selectedTags, networkExpanded]);
 
@@ -309,7 +330,7 @@ export function KnowledgePage() {
       }).then((payload) => {
         setResults(payload.results);
       }).catch((error) => {
-        setStatus(error instanceof Error ? error.message : "搜索失败");
+        setStatus(error instanceof Error ? error.message : "搜索失败", "danger");
       }).finally(() => {
         setSearching(false);
       });
@@ -427,7 +448,7 @@ export function KnowledgePage() {
       setReferences([]);
       setStatus("");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "新建会话失败");
+      setStatus(error instanceof Error ? error.message : "新建会话失败", "danger");
     }
   }
 
@@ -463,7 +484,7 @@ export function KnowledgePage() {
     void api.renameKnowledgeConversation(conversationId, title.trim()).then((next) => {
       setConversations((items) => items.map((item) => item.conversation_id === next.conversation_id ? next : item));
     }).catch((error) => {
-      setStatus(error instanceof Error ? error.message : "重命名会话失败");
+      setStatus(error instanceof Error ? error.message : "重命名会话失败", "danger");
     });
   }
 
@@ -485,7 +506,7 @@ export function KnowledgePage() {
         void handleNewConversation();
       }
     }).catch((error) => {
-      setStatus(error instanceof Error ? error.message : "删除会话失败");
+      setStatus(error instanceof Error ? error.message : "删除会话失败", "danger");
     });
   }
 
@@ -571,7 +592,7 @@ export function KnowledgePage() {
           onError: (message) => {
             flushPendingAssistantDelta();
             if (activeConversationIdRef.current === conversationId) {
-              setStatus(message);
+              setStatus(message, "danger");
             }
             updateMessage(assistantMessage.id, (current) => ({
               ...current,
@@ -595,7 +616,7 @@ export function KnowledgePage() {
       const detail = error instanceof Error ? error.message : "问答失败";
       flushPendingAssistantDelta();
       if (activeConversationIdRef.current === conversationId) {
-        setStatus(detail);
+        setStatus(detail, "danger");
       }
       updateMessage(assistantMessage.id, (message) => ({
         ...message,
@@ -632,14 +653,14 @@ export function KnowledgePage() {
     if (maintenanceBusy) {
       return;
     }
-    setStatus("正在为未标记视频自动打标...");
+    setStatus("正在为未标记视频自动打标...", "progress");
     try {
       setMaintenanceBusy(true);
       const payload = await api.autoTagKnowledge();
-      setStatus(`已处理 ${payload.items.length} 个视频`);
       await refreshBase();
+      setStatus(payload.items.length ? `已为 ${payload.items.length} 个视频自动打标（已跳过无摘要视频）` : "没有可自动打标的视频：仅处理已有摘要且未打标签的视频。");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "自动打标失败");
+      setStatus(error instanceof Error ? error.message : "自动打标失败", "danger");
     } finally {
       setMaintenanceBusy(false);
     }
@@ -649,14 +670,14 @@ export function KnowledgePage() {
     if (maintenanceBusy) {
       return;
     }
-    setStatus("正在重建知识库索引...");
+    setStatus("正在重建知识库索引...", "progress");
     try {
       setMaintenanceBusy(true);
       const payload = await api.rebuildKnowledgeIndex();
-      setStatus(`索引已重建，共处理 ${payload.indexed_videos} 个视频`);
       await refreshBase();
+      setStatus(`索引已重建，共处理 ${payload.indexed_videos} 个视频和 ${payload.indexed_documents} 篇文章`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "索引重建失败");
+      setStatus(error instanceof Error ? error.message : "索引重建失败", "danger");
     } finally {
       setMaintenanceBusy(false);
     }
@@ -666,15 +687,15 @@ export function KnowledgePage() {
     if (maintenanceBusy) {
       return;
     }
-    setStatus("正在自动打标并重建知识库索引...");
+    setStatus("正在自动打标并重建知识库索引...", "progress");
     try {
       setMaintenanceBusy(true);
       const tagPayload = await api.autoTagKnowledge();
       const indexPayload = await api.rebuildKnowledgeIndex();
-      setStatus(`已处理 ${tagPayload.items.length} 个标签任务，索引已重建 ${indexPayload.indexed_videos} 个视频`);
       await refreshBase();
+      setStatus(`已处理 ${tagPayload.items.length} 个标签任务，索引已重建 ${indexPayload.indexed_videos} 个视频和 ${indexPayload.indexed_documents} 篇文章`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "知识库维护失败");
+      setStatus(error instanceof Error ? error.message : "知识库维护失败", "danger");
     } finally {
       setMaintenanceBusy(false);
     }
@@ -685,11 +706,17 @@ export function KnowledgePage() {
       <div className="knowledge-topbar">
         <div className="knowledge-topbar-leading">
           <div className="knowledge-view-tabs">
-            <button className={`knowledge-view-tab ${activeView === "chat" ? "is-active" : ""}`} type="button" onClick={() => setActiveView("chat")}>
+            <button className={`knowledge-view-tab ${activeView === "chat" ? "is-active" : ""}`} type="button" onClick={() => selectView("chat")}>
               AI 问答
             </button>
-            <button className={`knowledge-view-tab ${activeView === "workspace" ? "is-active" : ""}`} type="button" onClick={() => setActiveView("workspace")}>
+            <button className={`knowledge-view-tab ${activeView === "workspace" ? "is-active" : ""}`} type="button" onClick={() => selectView("workspace")}>
               工作台
+            </button>
+            <button className={`knowledge-view-tab ${activeView === "articles" ? "is-active" : ""}`} type="button" onClick={() => selectView("articles")}>
+              文章
+            </button>
+            <button className={`knowledge-view-tab ${activeView === "classification" ? "is-active" : ""}`} type="button" onClick={() => selectView("classification")}>
+              内容分类
             </button>
           </div>
           {activeView === "chat" ? (
@@ -703,6 +730,10 @@ export function KnowledgePage() {
           {statsSummary.map((item) => (
             <span key={item.label} className="helper-chip">{item.label} {item.value}</span>
           ))}
+          <button className="primary-button knowledge-import-trigger" type="button" onClick={() => setArticleImportOpen(true)}>
+            <LinkIcon aria-hidden="true" />
+            <span>导入文章</span>
+          </button>
           <div className={`knowledge-maintenance-menu ${maintenanceMenuOpen ? "is-open" : ""}`} ref={maintenanceMenuRef}>
             <button
               className="secondary-button knowledge-maintenance-trigger"
@@ -763,7 +794,7 @@ export function KnowledgePage() {
       </div>
 
       {status ? <div className={`knowledge-status-banner ${statusTone}`} role={statusTone === "danger" ? "alert" : "status"}>{status}</div> : null}
-      {!stats?.knowledge_llm_available ? <div className="knowledge-status-banner warning">知识库 LLM 未就绪；系统信息问答和本地推荐仍可用，内容问答与自动打标需要先配置模型。</div> : null}
+      {!stats?.knowledge_llm_available ? <div className="knowledge-status-banner warning">知识库 LLM 未就绪；系统信息问答和本地推荐仍可用，内容问答与自动打标{canConfigure ? "需要先配置模型。" : "请联系管理员配置模型。"}</div> : null}
 
       {activeView === "chat" ? (
         <div className="knowledge-chat-layout">
@@ -824,11 +855,11 @@ export function KnowledgePage() {
             onReaggregate={(jobId) => {
               void api.reaggregateKnowledgeJob(jobId).then((job) => {
                 setChatMessages((current) => current.map((message) => message.job?.job_id === job.job_id ? { ...message, job, status: "waiting_tasks" } : message));
-              }).catch((error) => setStatus(error instanceof Error ? error.message : "重新聚合失败"));
+              }).catch((error) => setStatus(error instanceof Error ? error.message : "重新聚合失败", "danger"));
             }}
           />
         </div>
-      ) : (
+      ) : activeView === "workspace" ? (
         <div className="knowledge-workbench-shell">
           <SearchPanel
             query={query}
@@ -850,6 +881,11 @@ export function KnowledgePage() {
             onSelectVideo={(videoId) => navigate(`/videos/${videoId}`)}
           />
         </div>
+      ) : (
+        activeView === "classification" ? <ClassificationPanel onUpdated={() => {
+          setArticleRefreshToken((current) => current + 1);
+          void refreshBase();
+        }} /> : <ArticlesPanel refreshToken={articleRefreshToken} />
       )}
 
       <TagManager
@@ -857,6 +893,20 @@ export function KnowledgePage() {
         title={managingVideoId ? (videoTitleMap[managingVideoId] || managingVideoId) : ""}
         onClose={() => setManagingVideoId(null)}
         onUpdated={() => void refreshBase()}
+      />
+      <ArticleImportDialog
+        open={articleImportOpen}
+        onClose={() => setArticleImportOpen(false)}
+        onImported={(result) => {
+          const imageSummary = result.document.image_count
+            ? `，已理解 ${result.document.analyzed_image_count}/${result.document.image_count} 张图片`
+            : "";
+          const textSummary = result.document.summary_markdown ? "，已生成正文总结" : "";
+          setStatus(`${result.cached ? "文章已存在" : "文章已导入"}：${result.document.title}${textSummary}${imageSummary}`);
+          setArticleRefreshToken((current) => current + 1);
+          selectView("articles");
+          void refreshBase();
+        }}
       />
     </section>
   );

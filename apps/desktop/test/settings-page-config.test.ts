@@ -60,7 +60,13 @@ run("video settings can trigger bilibili cookie capture", () => {
   assert.ok(settingsPageSource.includes("window.desktop?.bilibili"), "settings cookie capture should reuse desktop bilibili bridge");
   assert.ok(settingsPageSource.includes("createBilibiliCookieQrcode"), "settings cookie capture should support web qrcode fallback");
   assert.ok(settingsPageSource.includes("pollBilibiliCookieQrcode"), "settings cookie capture should poll web qrcode login");
-  assert.ok(settingsPageSource.includes("登录获取"), "missing visible cookie capture button");
+  assert.ok(settingsPageSource.includes("B站登录"), "missing visible bilibili cookie capture button");
+});
+
+run("video settings can trigger douyin cookie capture", () => {
+  assert.ok(settingsPageSource.includes("captureDouyinLoginCookies"), "missing douyin cookie capture handler");
+  assert.ok(settingsPageSource.includes("window.desktop?.douyin"), "settings cookie capture should use desktop douyin bridge");
+  assert.ok(settingsPageSource.includes("抖音登录"), "missing visible douyin cookie capture button");
 });
 
 run("prompt presets can hide builtin presets from homepage routing", () => {
@@ -152,7 +158,7 @@ run("home prompt router calls match API and filters hidden presets", () => {
 run("home prompt presets can jump to settings editor", () => {
   const homePageSource = readFileSync(join(projectRoot, "src/pages/HomePage.tsx"), "utf8");
   const appSource = readFileSync(join(projectRoot, "src/App.tsx"), "utf8");
-  assert.ok(homePageSource.includes("onContextMenu={openPromptContextMenu}"), "home prompt selector should expose a context menu");
+  assert.ok(homePageSource.includes("onContextMenu={canConfigure ? openPromptContextMenu : undefined}"), "only admins should expose the prompt editing menu");
   assert.ok(homePageSource.includes("onEditPromptPreset(promptContextMenu.presetId)"), "context menu should request prompt preset editing");
   assert.ok(appSource.includes("navigateToPromptPreset"), "app should route prompt edit requests to settings");
   assert.ok(settingsPageSource.includes("promptPresetRequest"), "settings page should accept prompt preset navigation requests");

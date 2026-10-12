@@ -1,6 +1,10 @@
 import asyncio
 import sqlite3
 
+import pytest
+from fastapi import HTTPException
+from video_sum_core.models.tasks import InputType, TaskInput
+from video_sum_infra.config import ServiceSettings
 from video_sum_service.app import app
 from video_sum_service.repository import SqliteTaskRepository
 from video_sum_service.routers import videos as video_router
@@ -73,3 +77,71 @@ def test_get_local_video_media_returns_file_response(tmp_path) -> None:
 
     assert str(response.path).endswith("playable.mp4")
     assert response.media_type == "video/mp4"
+
+
+def test_get_douyin_video_media_returns_cached_task_source(monkeypatch, tmp_path) -> None:
+    repository = create_repository()
+    source_url = "https://www.douyin.com/video/6961737553342991651"
+    asset = repository.upsert_video_asset(
+        VideoAssetRecord(
+            canonical_id="6961737553342991651",
+            platform="douyin",
+            title="可定位的抖音视频",
+            source_url=source_url,
+            duration=12.0,
+        )
+    )
+    task = repository.create_task(
+        TaskInput(input_type=InputType.URL, source=source_url, title=asset.title),
+        video_id=asset.video_id,
+    )
+    tasks_dir = tmp_path / "tasks"
+    cached_video = tasks_dir / task.task_id / "source.douyin.mp4"
+    cached_video.parent.mkdir(parents=True)
+    cached_video.write_bytes(b"video-bytes")
+    monkeypatch.setattr(
+        video_router.settings_manager,
+        "_settings",
+        ServiceSettings(
+            data_dir=tmp_path / "data",
+            cache_dir=tmp_path / "cache",
+            tasks_dir=tasks_dir,
+        ),
+    )
+    app.state.task_repository = repository
+
+    request = type("Request", (), {"app": app})()
+    response = video_router.get_local_video_media(asset.video_id, request)
+
+    assert response.path == cached_video
+    assert response.media_type == "video/mp4"
+
+
+def test_get_douyin_video_media_requires_cached_task_source(monkeypatch, tmp_path) -> None:
+    repository = create_repository()
+    source_url = "https://www.douyin.com/video/6961737553342991651"
+    asset = repository.upsert_video_asset(
+        VideoAssetRecord(
+            canonical_id="6961737553342991651",
+            platform="douyin",
+            title="尚未缓存的抖音视频",
+            source_url=source_url,
+            duration=12.0,
+        )
+    )
+    monkeypatch.setattr(
+        video_router.settings_manager,
+        "_settings",
+        ServiceSettings(
+            data_dir=tmp_path / "data",
+            cache_dir=tmp_path / "cache",
+            tasks_dir=tmp_path / "tasks",
+        ),
+    )
+    app.state.task_repository = repository
+
+    with pytest.raises(HTTPException) as exc_info:
+        video_router.get_local_video_media(asset.video_id, type("Request", (), {"app": app})())
+
+    assert exc_info.value.status_code == 404
+    assert "缓存尚未生成" in exc_info.value.detail

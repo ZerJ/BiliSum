@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 
+
 function run(name: string, fn: () => Promise<void> | void) {
   Promise.resolve(fn()).then(() => {
     console.log(`ok - ${name}`);
@@ -13,8 +14,15 @@ run("calls markdown and transcript export APIs", async () => {
   const originalFetch = globalThis.fetch;
   const originalWindow = globalThis.window;
   const requests: Array<{ url: string; options?: RequestInit }> = [];
+  const storage = new Map<string, string>();
 
-  globalThis.window = { location: { origin: "http://127.0.0.1:3838" } } as typeof window;
+  globalThis.window = {
+    location: { origin: "http://127.0.0.1:3838" },
+    localStorage: {
+      getItem: (key: string) => storage.get(key) || null,
+      setItem: (key: string, value: string) => { storage.set(key, value); },
+    },
+  } as typeof window;
   globalThis.fetch = (async (url: string | URL | Request, options?: RequestInit) => {
     requests.push({ url: String(url), options });
     const rawUrl = String(url);
@@ -102,6 +110,13 @@ run("calls markdown and transcript export APIs", async () => {
     prompt_preset_id: "general",
     summary_scope: "summary",
   });
+  await api.importKnowledgeArticle({
+    url: "https://example.com/article",
+    analyze_images: false,
+    summarize: true,
+  });
+  await api.listKnowledgeArticles();
+  await api.getKnowledgeArticle("article / 1");
 
   assert.equal(requests[2]?.url, "/api/v1/prompts/presets");
   assert.equal(requests[3]?.url, "/api/v1/prompts/match");
@@ -135,6 +150,35 @@ run("calls markdown and transcript export APIs", async () => {
     prompt_preset_id: "general",
     summary_scope: "summary",
   });
+  assert.equal(requests[15]?.url, "/api/v1/knowledge/articles/import");
+  assert.equal(requests[15]?.options?.method, "POST");
+  assert.deepEqual(JSON.parse(String(requests[15]?.options?.body)), {
+    url: "https://example.com/article",
+    analyze_images: false,
+    summarize: true,
+  });
+  assert.equal(requests[16]?.url, "/api/v1/knowledge/articles");
+  assert.equal(requests[17]?.url, "/api/v1/knowledge/articles/article%20%2F%201");
+
+  await api.listKnowledgeArticles();
+  await api.listKnowledgeConversations();
+  await api.listKnowledgeUsers();
+  for (const request of requests.slice(-3)) {
+    assert.equal(new Headers(request.options?.headers).get("X-Knowledge-User-ID"), null);
+  }
+
+  await api.loginAccount("Alice", "secret-pass");
+  assert.equal(requests.at(-1)?.url, "/api/v1/auth/login");
+  assert.deepEqual(JSON.parse(String(requests.at(-1)?.options?.body)), { name: "Alice", password: "secret-pass" });
+  assert.equal(new Headers(requests.at(-1)?.options?.headers).get("Authorization"), null);
+  await api.setupAccount("Owner", "owner-pass", "setup-key");
+  assert.equal(new Headers(requests.at(-1)?.options?.headers).get("Authorization"), "Bearer setup-key");
+  await api.createKnowledgeUser("Bob", "bob-pass-123");
+  assert.deepEqual(JSON.parse(String(requests.at(-1)?.options?.body)), { name: "Bob", password: "bob-pass-123" });
+  await api.resetKnowledgeUserPassword("user-2", "replacement-pass");
+  assert.equal(requests.at(-1)?.url, "/api/v1/knowledge/users/user-2/credentials");
+  await api.logoutAccount();
+  assert.equal(requests.at(-1)?.url, "/api/v1/auth/logout");
 
   globalThis.fetch = originalFetch;
   globalThis.window = originalWindow;

@@ -9,9 +9,12 @@ import type {
   KnowledgeSearchRequest,
   KnowledgeSearchResponse,
   KnowledgeStatsResponse,
+  KnowledgeUser,
   KnowledgeTagListResponse,
   KnowledgeToolTrace,
   KnowledgeConversation,
+  KnowledgeDocument,
+  KnowledgeDocumentSummary,
   KnowledgeMessage,
   KnowledgeJob,
   KnowledgeReference,
@@ -89,15 +92,7 @@ export class AuthRequiredError extends Error {
 }
 
 async function withDesktopAuth(options?: RequestInit): Promise<RequestInit | undefined> {
-  const token = await window.desktop?.backend?.getAccessToken?.();
-  if (!token) {
-    return options;
-  }
-  const headers = new Headers(options?.headers);
-  if (!headers.has("Authorization")) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
-  return { ...options, headers };
+  return options;
 }
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
@@ -148,12 +143,32 @@ function parseSseBlock(block: string): { event: string; data: string } | null {
 
 export const api = {
   getAuthStatus() {
-    return fetchJson<AuthStatus>("/api/v1/auth/status");
+    return fetchJson<AuthStatus>("/api/v1/auth/status", { cache: "no-store" });
   },
   createAuthSession(token: string) {
     return fetchJson<AuthStatus>("/api/v1/auth/session", {
       method: "POST",
       headers: { Authorization: `Bearer ${token}` },
+    });
+  },
+  setupAccount(name: string, password: string, token: string) {
+    return fetchJson<AuthStatus>("/api/v1/auth/setup", {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name, password }),
+    });
+  },
+  loginAccount(name: string, password: string) {
+    return fetchJson<AuthStatus>("/api/v1/auth/login", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, password }),
+    });
+  },
+  logoutAccount() {
+    return fetchJson<{ authenticated: boolean }>("/api/v1/auth/logout", { method: "POST" });
+  },
+  changePassword(currentPassword: string, newPassword: string) {
+    return fetchJson<{ updated: boolean }>("/api/v1/auth/password", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
     });
   },
   getHealth() {
@@ -257,6 +272,13 @@ export const api = {
   },
   pollBilibiliCookieQrcode(qrcodeKey: string) {
     return fetchJson<BilibiliQrcodePollResponse>(`/api/v1/bilibili/cookies/qrcode/${encodeURIComponent(qrcodeKey)}`);
+  },
+  importDouyinCookies(content: string) {
+    return fetchJson<BilibiliCookieCaptureResponse>("/api/v1/douyin/cookies/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
   },
   getSystemLogs(lines = 200) {
     return fetchJson<SystemLogResponse>(`/api/v1/system/logs?lines=${lines}`);
@@ -660,6 +682,51 @@ export const api = {
     }
     return fetchJson<KnowledgeTagListResponse | VideoKnowledgeTagListResponse>(url.toString());
   },
+  listKnowledgeUsers() {
+    return fetchJson<KnowledgeUser[]>("/api/v1/knowledge/users");
+  },
+  createKnowledgeUser(name: string, password: string) {
+    return fetchJson<KnowledgeUser>("/api/v1/knowledge/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, password }),
+    });
+  },
+  renameKnowledgeUser(userId: string, name: string) {
+    return fetchJson<KnowledgeUser>(`/api/v1/knowledge/users/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+  },
+  deleteKnowledgeUser(userId: string) {
+    return fetchJson<{ deleted: boolean }>(
+      `/api/v1/knowledge/users/${encodeURIComponent(userId)}`,
+      { method: "DELETE" },
+    );
+  },
+  resetKnowledgeUserPassword(userId: string, password: string) {
+    return fetchJson<{ updated: boolean }>(`/api/v1/knowledge/users/${encodeURIComponent(userId)}/credentials`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password }),
+    });
+  },
+  listKnowledgeContent() {
+    return fetchJson<import("./types").KnowledgeContentItem[]>("/api/v1/knowledge/content");
+  },
+  setKnowledgeContentMembership(items: Array<{ id: string; kind: "video" | "article" }>, included: boolean) {
+    return fetchJson<{ updated: number }>("/api/v1/knowledge/content/membership", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items, included }),
+    });
+  },
+  classifyKnowledgeContent(items: Array<{ id: string; kind: "video" | "article" }>, category: string) {
+    return fetchJson<{ updated: number }>("/api/v1/knowledge/content/category", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items, category }),
+    });
+  },
   addKnowledgeTag(payload: { video_id: string; tag: string }) {
     return fetchJson<VideoKnowledgeTagListResponse>("/api/v1/knowledge/tags", {
       method: "POST",
@@ -700,6 +767,24 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+  },
+  importKnowledgeArticle(payload: {
+    url: string;
+    analyze_images?: boolean;
+    summarize?: boolean;
+    force_refresh?: boolean;
+  }) {
+    return fetchJson<import("./types").KnowledgeArticleImportResponse>("/api/v1/knowledge/articles/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+  listKnowledgeArticles() {
+    return fetchJson<KnowledgeDocumentSummary[]>("/api/v1/knowledge/articles");
+  },
+  getKnowledgeArticle(documentId: string) {
+    return fetchJson<KnowledgeDocument>(`/api/v1/knowledge/articles/${encodeURIComponent(documentId)}`);
   },
   listKnowledgeConversations() {
     return fetchJson<KnowledgeConversation[]>("/api/v1/knowledge/conversations");
@@ -838,7 +923,7 @@ export const api = {
     return fetchJson<KnowledgeStatsResponse>("/api/v1/knowledge/stats");
   },
   rebuildKnowledgeIndex() {
-    return fetchJson<{ indexed_videos: number }>("/api/v1/knowledge/rebuild-index", {
+    return fetchJson<{ indexed_videos: number; indexed_documents: number }>("/api/v1/knowledge/rebuild-index", {
       method: "POST",
     });
   },

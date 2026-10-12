@@ -4,12 +4,13 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from video_sum_service.auth import is_auth_exempt_path, request_is_authorized, unauthorized_response
+from video_sum_service.auth import account_from_request, is_auth_exempt_path, request_is_authorized, unauthorized_response
 from video_sum_core.models.tasks import TaskStatus
 from video_sum_infra.db import connect_sqlite
 from video_sum_infra.config import normalize_visual_note_mode
@@ -160,9 +161,39 @@ async def touch_cli_activity(request, call_next):
 @app.middleware("http")
 async def require_api_access_token(request, call_next):
     path = request.url.path
-    if path.startswith("/api/v1/") and not is_auth_exempt_path(path, request.method):
+    repository = getattr(request.app.state, "task_repository", None)
+    accounts_enabled = repository is not None and repository.accounts_enabled()
+    if accounts_enabled and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        if origin:
+            try:
+                same_origin = urlsplit(origin).netloc == request.headers.get("host")
+            except ValueError:
+                same_origin = False
+            if not same_origin:
+                return JSONResponse(status_code=403, content={"detail": "跨站请求已拒绝。"})
+    protected_media = accounts_enabled and (
+        path.startswith("/media/") or "/visual-evidence/media/" in path
+    )
+    admin_only = accounts_enabled and (
+        (path == "/api/v1/settings" and request.method != "GET")
+        or (path.startswith("/api/v1/prompts/presets") and request.method != "GET")
+        or path in {
+            "/api/v1/runtime/sync", "/api/v1/runtime/uninstall-packages",
+            "/api/v1/system/shutdown", "/api/v1/cuda/install", "/api/v1/asr/local/install",
+            "/api/v1/asr/funasr/install", "/api/v1/knowledge/install",
+            "/api/v1/knowledge/embedding/download", "/api/v1/bilibili/cookies/capture",
+            "/api/v1/bilibili/cookies/qrcode", "/api/v1/llm/test", "/api/v1/asr/test",
+            "/api/v1/douyin/cookies/import",
+            "/api/v1/knowledge/embedding/test", "/api/v1/system/logs", "/api/v1/asr/install-log",
+        }
+        or path.startswith("/api/v1/bilibili/cookies/qrcode/")
+    )
+    if protected_media or (path.startswith("/api/v1/") and not is_auth_exempt_path(path, request.method)):
         if not request_is_authorized(request, access_token_manager):
             return unauthorized_response()
+    if admin_only and not bool((account_from_request(request) or {}).get("is_admin")):
+        return JSONResponse(status_code=403, content={"detail": "仅管理员可以修改全局设置。"})
     return await call_next(request)
 
 

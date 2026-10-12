@@ -230,6 +230,58 @@
   gap: 18px;
 }
 
+.cookie-help-qrcode {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  background: var(--bg-card);
+  text-align: center;
+}
+
+.cookie-help-qrcode img {
+  padding: 8px;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.cookie-help-qrcode p {
+  margin: 0;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.cookie-import-field {
+  display: grid;
+  gap: 10px;
+}
+
+.cookie-import-field span,
+.cookie-import-help p {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.cookie-import-field textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.cookie-import-help summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.cookie-import-error {
+  color: var(--text-danger, #c53030);
+  overflow-wrap: anywhere;
+}
+
 .startup-announcement-body {
   display: grid;
   gap: 18px;

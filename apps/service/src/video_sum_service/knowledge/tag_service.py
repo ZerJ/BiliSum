@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 from video_sum_infra.config import ServiceSettings
 from video_sum_service.knowledge.local_llm import chat_knowledge_llm, parse_json_payload
-from video_sum_service.repository import SqliteTaskRepository
+from video_sum_service.repository import DEFAULT_KNOWLEDGE_USER_ID, SqliteTaskRepository
 from video_sum_service.schemas import (
     KnowledgeAutoTagResponse,
     KnowledgeAutoTagVideoResult,
@@ -20,27 +20,46 @@ from video_sum_service.schemas import (
 
 
 class TagService:
-    def __init__(self, repository: SqliteTaskRepository, settings: ServiceSettings) -> None:
+    def __init__(
+        self,
+        repository: SqliteTaskRepository,
+        settings: ServiceSettings,
+        knowledge_user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> None:
         self._repository = repository
         self._settings = settings
+        self._knowledge_user_id = knowledge_user_id
 
     def add_tag(self, video_id: str, tag: str, source: str = "manual", confidence: float = 1.0) -> bool:
-        return self._repository.add_video_tag(video_id, tag, source=source, confidence=confidence)
+        return self._repository.add_video_tag(
+            video_id,
+            tag,
+            source=source,
+            confidence=confidence,
+            user_id=self._knowledge_user_id,
+        )
 
     def remove_tag(self, video_id: str, tag: str) -> bool:
-        return self._repository.remove_video_tag(video_id, tag)
+        return self._repository.remove_video_tag(
+            video_id,
+            tag,
+            user_id=self._knowledge_user_id,
+        )
 
     def get_tags_for_video(self, video_id: str) -> list[VideoTagRecord]:
-        return self._repository.list_video_tags(video_id)
+        return self._repository.list_video_tags(video_id, user_id=self._knowledge_user_id)
 
     def get_all_tags(self) -> list[TagItem]:
-        return [TagItem.model_validate(item) for item in self._repository.list_all_tags()]
+        return [
+            TagItem.model_validate(item)
+            for item in self._repository.list_all_tags(self._knowledge_user_id)
+        ]
 
     def auto_tag_video(self, video_id: str, llm_model: str | None = None) -> list[str]:
         del llm_model
         video = self._repository.get_video_asset(video_id)
         if video is None or video.latest_result is None:
-            raise HTTPException(status_code=404, detail="Video not found or has no summary result.")
+            raise HTTPException(status_code=404, detail="自动打标失败：视频不存在或尚未生成摘要，请先完成视频总结。")
 
         result = video.latest_result
         content = "\n\n".join(
@@ -82,13 +101,33 @@ class TagService:
                 continue
             seen.add(tag)
             normalized_tags.append(tag)
-            self._repository.add_video_tag(video_id, tag, source="auto_llm", confidence=0.8)
+            self._repository.add_video_tag(
+                video_id,
+                tag,
+                source="auto_llm",
+                confidence=0.8,
+                user_id=self._knowledge_user_id,
+            )
         return normalized_tags
 
     def batch_auto_tag(self, video_ids: list[str] | None = None) -> KnowledgeAutoTagResponse:
-        target_video_ids = video_ids or self._repository.list_untagged_video_ids()
+        if video_ids == []:
+            return KnowledgeAutoTagResponse(items=[])
+        included_video_ids = self._repository.list_knowledge_content_ids(
+            self._knowledge_user_id,
+            "video",
+        )
+        target_video_ids = (
+            [video_id for video_id in video_ids if video_id in included_video_ids]
+            if video_ids is not None
+            else self._repository.list_untagged_video_ids(self._knowledge_user_id)
+        )
         items: list[KnowledgeAutoTagVideoResult] = []
         for video_id in target_video_ids:
+            if video_ids is None:
+                video = self._repository.get_video_asset(video_id)
+                if video is None or video.latest_result is None:
+                    continue
             tags = self.auto_tag_video(video_id)
             items.append(KnowledgeAutoTagVideoResult(video_id=video_id, tags=tags))
         return KnowledgeAutoTagResponse(items=items)
@@ -100,8 +139,8 @@ class TagService:
         max_tags: int = 12,
         max_videos: int = 8,
     ) -> KnowledgeNetworkResponse:
-        all_tags = self._repository.list_all_tags()
-        all_video_tags = self._repository.list_all_video_tags()
+        all_tags = self._repository.list_all_tags(self._knowledge_user_id)
+        all_video_tags = self._repository.list_all_video_tags(self._knowledge_user_id)
         selected = [tag for tag in dict.fromkeys(selected_tags or []) if tag]
         tag_counts = {str(item["tag"]): int(item["count"]) for item in all_tags}
         video_tag_map: dict[str, list[str]] = {}

@@ -33,7 +33,7 @@ import {
 } from "../detailModel";
 import type { LlmUsageRecord, MindMapNode, TaskDetail, TaskEvent, TaskMarkdownExportResponse, TaskMindMapResponse, TaskResult, TaskStatus, TaskSummary, TaskVisualEvidenceResponse, VideoAssetDetail, VideoPageBatchOption, VideoTaskBatchResponse, VisualEvidenceFrame, VisualEvidenceObservation } from "../types";
 import { formatDateTime, formatDuration, formatTaskDuration, formatTokenCount, sanitizeMindMapLabel, summarizeEvents, taskStatusLabel } from "../utils";
-import { buildPlayerEmbedDescriptor, withPlayerSeek } from "../videoPlayer";
+import { buildCachedVideoMediaUrl, buildPlayerEmbedDescriptor, withPlayerSeek } from "../videoPlayer";
 
 type TaskContext = {
   detail: TaskDetail;
@@ -286,7 +286,6 @@ const FLOATING_PLAYER_DEFAULT_WIDTH = 360;
 const FLOATING_PLAYER_VIEWPORT_MARGIN = 20;
 const FLOATING_PLAYER_TOP_OFFSET = 92;
 const FLOATING_PLAYER_CHROME_HEIGHT = 62;
-const LOCAL_VIDEO_SUFFIXES = new Set([".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".flv", ".m4v", ".ts", ".mpeg", ".mpg"]);
 const SUMMARY_PREFERENCE_STORAGE_KEY = "bilisum.summaryPreference";
 
 const detailTabs: Array<{ id: DetailTab; label: string; description: string }> = [
@@ -473,6 +472,7 @@ function IconFavorite(props: SVGProps<SVGSVGElement>) {
 }
 
 function isBilibiliCookieHelpError(message: string) {
+  if (/抖音/i.test(message)) return false;
   return /HTTP\s*412|cookies?\.txt|B\s*站返回|Bilibili rejected|风控拦截|登录态|cookiesfrombrowser|DPAPI/i.test(message);
 }
 
@@ -1406,24 +1406,19 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
     }
     return withPlayerSeek(playerDescriptor.embedUrl, playerDescriptor.platform, playerSeekTarget.seconds, playerSeekTarget.nonce);
   }, [playerDescriptor, playerSeekTarget]);
+  const videoPlatform = String(video?.platform || "").toLowerCase();
+  const isDouyinVideo = videoPlatform === "douyin";
   const localPlayerUrl = useMemo(() => {
-    if (!video || String(video.platform || "").toLowerCase() !== "local") {
+    if (!video || isAggregateSummaryView) {
       return null;
     }
-    if (isAggregateSummaryView) {
-      return null;
-    }
-    const source = currentPage?.source_url || video.source_url;
-    const suffix = (() => {
-      try {
-        return `.${new URL(source, window.location.origin).pathname.split(".").pop()?.toLowerCase() || ""}`;
-      } catch {
-        const parts = String(source || "").split(".");
-        return parts.length > 1 ? `.${parts[parts.length - 1].toLowerCase()}` : "";
-      }
-    })();
-    return LOCAL_VIDEO_SUFFIXES.has(suffix) ? `/api/v1/videos/${video.video_id}/media` : null;
-  }, [currentPage?.source_url, isAggregateSummaryView, video]);
+    return buildCachedVideoMediaUrl(
+      video.video_id,
+      videoPlatform,
+      currentPage?.source_url || video.source_url,
+      selectedTaskStatus || "unknown",
+    );
+  }, [currentPage?.source_url, isAggregateSummaryView, selectedTaskStatus, video, videoPlatform]);
   const hasSeekablePlayer = Boolean(localPlayerUrl || playerDescriptor);
   const readyMindMap = selectedMindMap?.status === "ready" && selectedTaskDetail?.result?.mindmap_status !== "generating"
     ? selectedMindMap.mindmap ?? null
@@ -1730,7 +1725,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
   }
 
   const heroSourceTarget = currentPage?.source_url || video.source_url;
-  const isLocalVideo = String(video.platform || "").toLowerCase() === "local";
+  const isLocalVideo = videoPlatform === "local";
   const canOpenLocalSource = isLocalVideo && Boolean(window.desktop?.shell) && Boolean(heroSourceTarget);
 
   async function handleOpenLocalSource() {
@@ -2589,7 +2584,11 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                         <div className="detail-overview-player" ref={playerFrameRef}>
                           <div className="detail-section-heading">
                             <h3 className="detail-section-label">Player</h3>
-                            <span className="detail-section-meta detail-section-link">本地视频播放器</span>
+                            {isDouyinVideo ? (
+                              <a className="detail-section-meta detail-section-link" href={heroSourceTarget} target="_blank" rel="noreferrer">在抖音打开</a>
+                            ) : (
+                              <span className="detail-section-meta detail-section-link">本地视频播放器</span>
+                            )}
                           </div>
                           <div className="detail-video-embed-frame">
                             <video
@@ -3109,8 +3108,8 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
               <FloatingVideoPlayer
                 embedUrl={playerEmbedUrl}
                 localVideoUrl={localPlayerUrl}
-                openLabel={playerDescriptor?.openLabel}
-                sourceUrl={playerDescriptor?.sourceUrl}
+                openLabel={playerDescriptor?.openLabel || (isDouyinVideo ? "在抖音打开" : null)}
+                sourceUrl={playerDescriptor?.sourceUrl || (isDouyinVideo ? heroSourceTarget : null)}
                 seekTarget={playerSeekTarget}
                 title={video.title}
               />

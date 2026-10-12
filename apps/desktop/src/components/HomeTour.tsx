@@ -11,7 +11,7 @@ const TOUR_STEPS: TourStep[] = [
   {
     targetSelector: "[data-home-tour='input']",
     title: "输入或导入",
-    description: "在这里粘贴 Bilibili / YouTube 视频链接、输入 BV 号，或粘贴/拖入本地媒体文件。",
+    description: "在这里粘贴 Bilibili / YouTube / 抖音视频链接、输入 BV 号，或粘贴/拖入本地媒体文件。",
     placement: "bottom",
   },
   {

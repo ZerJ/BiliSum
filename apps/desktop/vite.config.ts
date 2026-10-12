@@ -6,6 +6,7 @@ const root = __dirname;
 const backendStaticRoot = path.resolve(root, "../web/static");
 const accessToken = process.env.VIDEO_SUM_ACCESS_TOKEN || "";
 const proxyHeaders = accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined;
+const backendTarget = process.env.BILISUM_DEV_BACKEND_URL || "http://127.0.0.1:3838";
 
 export default defineConfig(({ command }) => ({
   root,
@@ -20,19 +21,19 @@ export default defineConfig(({ command }) => ({
     },
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:3838",
+        target: backendTarget,
         headers: proxyHeaders,
       },
-      "/health": "http://127.0.0.1:3838",
+      "/health": backendTarget,
       "/media": {
-        target: "http://127.0.0.1:3838",
+        target: backendTarget,
         headers: proxyHeaders,
       },
-      "/static/assets/icons": "http://127.0.0.1:3838",
-      "/static/favicon.ico": "http://127.0.0.1:3838",
-      "/static/favicon.svg": "http://127.0.0.1:3838",
-      "/static/favicon-32x32.png": "http://127.0.0.1:3838",
-      "/static/apple-touch-icon.png": "http://127.0.0.1:3838",
+      "/static/assets/icons": backendTarget,
+      "/static/favicon.ico": backendTarget,
+      "/static/favicon.svg": backendTarget,
+      "/static/favicon-32x32.png": backendTarget,
+      "/static/apple-touch-icon.png": backendTarget,
     },
   },
   build: {

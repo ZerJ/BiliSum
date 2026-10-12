@@ -9,6 +9,8 @@ from uuid import uuid4
 from video_sum_core.models.tasks import TaskInput, TaskResult, TaskStatus
 from video_sum_infra.db import sqlite_cursor
 from video_sum_service.schemas import (
+    KnowledgeDocumentChunkRecord,
+    KnowledgeDocumentRecord,
     KnowledgeIndexChunkRecord,
     TaskEventRecord,
     TaskRecord,
@@ -22,6 +24,7 @@ from video_sum_service.schemas import (
 )
 
 _UNSET = object()
+DEFAULT_KNOWLEDGE_USER_ID = "default"
 
 
 class SqliteTaskRepository:
@@ -67,6 +70,7 @@ class SqliteTaskRepository:
             self._ensure_column(cursor, "video_assets", "is_favorite", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(cursor, "video_assets", "favorite_updated_at", "TEXT")
             self._ensure_column(cursor, "video_assets", "folder_id", "TEXT")
+            self._ensure_column(cursor, "video_assets", "knowledge_category", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(cursor, "video_assets", "global_order", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(cursor, "video_assets", "folder_order", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(cursor, "video_assets", "global_pinned", "INTEGER NOT NULL DEFAULT 0")
@@ -309,6 +313,75 @@ class SqliteTaskRepository:
                 )
                 """
             )
+            now = datetime.now(timezone.utc).isoformat()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_users (
+                    user_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO knowledge_users (
+                    user_id, name, is_default, created_at, updated_at
+                ) VALUES (?, '默认用户', 1, ?, ?)
+                """,
+                (DEFAULT_KNOWLEDGE_USER_ID, now, now),
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_accounts (
+                    user_id TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    is_admin INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(user_id) REFERENCES knowledge_users(user_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS account_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES knowledge_users(user_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_user_content (
+                    user_id TEXT NOT NULL,
+                    content_kind TEXT NOT NULL,
+                    content_id TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, content_kind, content_id),
+                    FOREIGN KEY(user_id) REFERENCES knowledge_users(user_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_user_video_tags (
+                    user_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, video_id, tag),
+                    FOREIGN KEY(user_id) REFERENCES knowledge_users(user_id),
+                    FOREIGN KEY(video_id) REFERENCES video_assets(video_id)
+                )
+                """
+            )
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS knowledge_index (
@@ -338,14 +411,113 @@ class SqliteTaskRepository:
             self._ensure_column(cursor, "knowledge_index", "updated_at", "TEXT")
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS knowledge_documents (
+                    document_id TEXT PRIMARY KEY,
+                    source_url TEXT NOT NULL,
+                    canonical_url TEXT NOT NULL UNIQUE,
+                    source_type TEXT NOT NULL DEFAULT 'article',
+                    title TEXT NOT NULL,
+                    author TEXT NOT NULL DEFAULT '',
+                    published_at TEXT,
+                    cover_url TEXT NOT NULL DEFAULT '',
+                    content_markdown TEXT NOT NULL,
+                    plain_text TEXT NOT NULL,
+                    summary_markdown TEXT NOT NULL DEFAULT '',
+                    image_count INTEGER NOT NULL DEFAULT 0,
+                    analyzed_image_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._ensure_column(
+                cursor,
+                "knowledge_documents",
+                "summary_markdown",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(cursor, "knowledge_documents", "knowledge_category", "TEXT NOT NULL DEFAULT ''")
+            migration = cursor.execute(
+                "SELECT value FROM library_preferences WHERE key = 'knowledge_users_migrated'"
+            ).fetchone()
+            if migration is None:
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO knowledge_user_content (
+                        user_id, content_kind, content_id, category, created_at, updated_at
+                    )
+                    SELECT ?, 'video', video_id, knowledge_category, created_at, updated_at
+                    FROM video_assets
+                    """,
+                    (DEFAULT_KNOWLEDGE_USER_ID,),
+                )
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO knowledge_user_content (
+                        user_id, content_kind, content_id, category, created_at, updated_at
+                    )
+                    SELECT ?, 'article', document_id, knowledge_category, created_at, updated_at
+                    FROM knowledge_documents
+                    """,
+                    (DEFAULT_KNOWLEDGE_USER_ID,),
+                )
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO knowledge_user_video_tags (
+                        user_id, video_id, tag, source, confidence, created_at
+                    )
+                    SELECT ?, video_id, tag, source, confidence, created_at FROM video_tags
+                    """,
+                    (DEFAULT_KNOWLEDGE_USER_ID,),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO library_preferences (key, value, updated_at)
+                    VALUES ('knowledge_users_migrated', '1', ?)
+                    """,
+                    (now,),
+                )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_document_index (
+                    chunk_id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    embedding_json TEXT NOT NULL,
+                    indexed_content TEXT NOT NULL,
+                    index_type TEXT NOT NULL DEFAULT 'article_section',
+                    segment_order INTEGER,
+                    anchor_label TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(document_id) REFERENCES knowledge_documents(document_id)
+                )
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_document_index_document_id "
+                "ON knowledge_document_index(document_id)"
+            )
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS knowledge_conversations (
                     conversation_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL DEFAULT 'default',
                     title TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_message_at TEXT
                 )
                 """
+            )
+            self._ensure_column(
+                cursor,
+                "knowledge_conversations",
+                "user_id",
+                "TEXT NOT NULL DEFAULT 'default'",
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_conversations_user_id "
+                "ON knowledge_conversations(user_id, updated_at DESC)"
             )
             cursor.execute(
                 """
@@ -532,16 +704,62 @@ class SqliteTaskRepository:
                 "UPDATE tasks SET video_id = ? WHERE video_id = ?",
                 (primary_video_id, duplicate_id),
             )
-            cursor.execute("DELETE FROM video_assets WHERE video_id = ?", (duplicate_id,))
+            memberships = cursor.execute(
+                """
+                SELECT user_id, category, created_at, updated_at
+                FROM knowledge_user_content
+                WHERE content_kind = 'video' AND content_id = ?
+                """,
+                (duplicate_id,),
+            ).fetchall()
+            for membership in memberships:
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO knowledge_user_content (
+                        user_id, content_kind, content_id, category, created_at, updated_at
+                    ) VALUES (?, 'video', ?, ?, ?, ?)
+                    """,
+                    (
+                        membership["user_id"],
+                        primary_video_id,
+                        membership["category"],
+                        membership["created_at"],
+                        membership["updated_at"],
+                    ),
+                )
+            cursor.execute(
+                "DELETE FROM knowledge_user_content "
+                "WHERE content_kind = 'video' AND content_id = ?",
+                (duplicate_id,),
+            )
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO knowledge_user_video_tags (
+                    user_id, video_id, tag, source, confidence, created_at
+                )
+                SELECT user_id, ?, tag, source, confidence, created_at
+                FROM knowledge_user_video_tags WHERE video_id = ?
+                """,
+                (primary_video_id, duplicate_id),
+            )
+            cursor.execute(
+                "DELETE FROM knowledge_user_video_tags WHERE video_id = ?",
+                (duplicate_id,),
+            )
             cursor.execute(
                 "UPDATE OR IGNORE video_folder_memberships SET video_id = ? WHERE video_id = ?",
                 (primary_video_id, duplicate_id),
             )
             cursor.execute("DELETE FROM video_folder_memberships WHERE video_id = ?", (duplicate_id,))
+            cursor.execute("DELETE FROM video_assets WHERE video_id = ?", (duplicate_id,))
 
         return primary_video_id, created_at
 
-    def upsert_video_asset(self, asset: VideoAssetRecord) -> VideoAssetRecord:
+    def upsert_video_asset(
+        self,
+        asset: VideoAssetRecord,
+        knowledge_user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> VideoAssetRecord:
         updated_at = datetime.now(timezone.utc).isoformat()
         created_at = asset.created_at.isoformat()
         with self._lock, sqlite_cursor(self._connection) as cursor:
@@ -634,6 +852,15 @@ class SqliteTaskRepository:
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (video_id, folder_id, folder_order, 1 if folder_pinned else 0, created, updated_at),
+                )
+            if existing is None and consolidated is None:
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO knowledge_user_content (
+                        user_id, content_kind, content_id, category, created_at, updated_at
+                    ) VALUES (?, 'video', ?, '', ?, ?)
+                    """,
+                    (knowledge_user_id, video_id, created, updated_at),
                 )
         refreshed = self.get_video_asset(video_id)
         assert refreshed is not None
@@ -821,6 +1048,280 @@ class SqliteTaskRepository:
             ).fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    def get_knowledge_user(self, user_id: str) -> dict[str, object] | None:
+        normalized = str(user_id or DEFAULT_KNOWLEDGE_USER_ID).strip()
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            row = cursor.execute(
+                "SELECT u.user_id, u.name, u.is_default, u.created_at, u.updated_at, "
+                "a.is_admin, a.user_id AS account_id FROM knowledge_users u "
+                "LEFT JOIN user_accounts a ON a.user_id = u.user_id WHERE u.user_id = ?",
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "user_id": str(row["user_id"]),
+            "name": str(row["name"]),
+            "is_default": bool(row["is_default"]),
+            "is_admin": bool(row["is_admin"]),
+            "has_login": row["account_id"] is not None,
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_knowledge_users(self) -> list[dict[str, object]]:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            rows = cursor.execute(
+                """
+                SELECT u.user_id, u.name, u.is_default, u.created_at, u.updated_at,
+                       a.is_admin, a.user_id AS account_id
+                FROM knowledge_users u LEFT JOIN user_accounts a ON a.user_id = u.user_id
+                ORDER BY is_default DESC, name COLLATE NOCASE, created_at
+                """
+            ).fetchall()
+        return [
+            {
+                "user_id": str(row["user_id"]),
+                "name": str(row["name"]),
+                "is_default": bool(row["is_default"]),
+                "is_admin": bool(row["is_admin"]),
+                "has_login": row["account_id"] is not None,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def create_knowledge_user(self, name: str) -> dict[str, object]:
+        clean_name = str(name or "").strip()[:60]
+        if not clean_name:
+            raise ValueError("Knowledge user name is required.")
+        user_id = uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._lock, sqlite_cursor(self._connection) as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO knowledge_users (user_id, name, is_default, created_at, updated_at)
+                    VALUES (?, ?, 0, ?, ?)
+                    """,
+                    (user_id, clean_name, now, now),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Knowledge user name already exists.") from exc
+        return self.get_knowledge_user(user_id) or {}
+
+    def update_knowledge_user(self, user_id: str, name: str) -> dict[str, object] | None:
+        clean_name = str(name or "").strip()[:60]
+        if not clean_name:
+            raise ValueError("Knowledge user name is required.")
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._lock, sqlite_cursor(self._connection) as cursor:
+                result = cursor.execute(
+                    "UPDATE knowledge_users SET name = ?, updated_at = ? WHERE user_id = ?",
+                    (clean_name, now, user_id),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Knowledge user name already exists.") from exc
+        if result.rowcount <= 0:
+            return None
+        return self.get_knowledge_user(user_id)
+
+    def delete_knowledge_user(self, user_id: str) -> bool:
+        if user_id == DEFAULT_KNOWLEDGE_USER_ID:
+            raise ValueError("The default knowledge user cannot be deleted.")
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            user = cursor.execute(
+                "SELECT user_id FROM knowledge_users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if user is None:
+                return False
+            conversations = cursor.execute(
+                "SELECT conversation_id FROM knowledge_conversations WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+            conversation_ids = [str(row["conversation_id"]) for row in conversations]
+            if conversation_ids:
+                placeholders = ", ".join("?" for _ in conversation_ids)
+                jobs = cursor.execute(
+                    f"SELECT job_id FROM knowledge_jobs WHERE conversation_id IN ({placeholders})",
+                    conversation_ids,
+                ).fetchall()
+                job_ids = [str(row["job_id"]) for row in jobs]
+                if job_ids:
+                    job_placeholders = ", ".join("?" for _ in job_ids)
+                    cursor.execute(
+                        f"DELETE FROM knowledge_job_items WHERE job_id IN ({job_placeholders})",
+                        job_ids,
+                    )
+                    cursor.execute(
+                        f"DELETE FROM knowledge_jobs WHERE job_id IN ({job_placeholders})",
+                        job_ids,
+                    )
+                cursor.execute(
+                    f"DELETE FROM knowledge_messages WHERE conversation_id IN ({placeholders})",
+                    conversation_ids,
+                )
+                cursor.execute(
+                    f"DELETE FROM knowledge_conversations WHERE conversation_id IN ({placeholders})",
+                    conversation_ids,
+                )
+            cursor.execute("DELETE FROM knowledge_user_video_tags WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM knowledge_user_content WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM account_sessions WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM user_accounts WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM knowledge_users WHERE user_id = ?", (user_id,))
+        return True
+
+    def accounts_enabled(self) -> bool:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            return cursor.execute("SELECT 1 FROM user_accounts LIMIT 1").fetchone() is not None
+
+    def setup_admin(self, name: str, password_hash: str) -> dict[str, object] | None:
+        if not name:
+            raise ValueError("Account name is required.")
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._lock, sqlite_cursor(self._connection) as cursor:
+                if cursor.execute("SELECT 1 FROM user_accounts LIMIT 1").fetchone():
+                    return None
+                cursor.execute(
+                    "UPDATE knowledge_users SET name = ?, updated_at = ? WHERE user_id = ?",
+                    (name, now, DEFAULT_KNOWLEDGE_USER_ID),
+                )
+                cursor.execute(
+                    "INSERT INTO user_accounts (user_id, password_hash, is_admin) VALUES (?, ?, 1)",
+                    (DEFAULT_KNOWLEDGE_USER_ID, password_hash),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Account name already exists.") from exc
+        return self.get_knowledge_user(DEFAULT_KNOWLEDGE_USER_ID)
+
+    def get_account_by_name(self, name: str) -> dict[str, object] | None:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            row = cursor.execute(
+                "SELECT u.user_id, a.password_hash FROM knowledge_users u "
+                "JOIN user_accounts a ON a.user_id = u.user_id WHERE u.name = ? COLLATE NOCASE",
+                (name,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_account_password(self, user_id: str, password_hash: str, *, is_admin: bool | None = None) -> bool:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            if cursor.execute("SELECT 1 FROM knowledge_users WHERE user_id = ?", (user_id,)).fetchone() is None:
+                return False
+            existing = cursor.execute("SELECT is_admin FROM user_accounts WHERE user_id = ?", (user_id,)).fetchone()
+            admin = bool(is_admin) if is_admin is not None else bool(existing["is_admin"]) if existing else False
+            cursor.execute(
+                "INSERT INTO user_accounts (user_id, password_hash, is_admin) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET password_hash = excluded.password_hash, is_admin = excluded.is_admin",
+                (user_id, password_hash, int(admin)),
+            )
+            cursor.execute("DELETE FROM account_sessions WHERE user_id = ?", (user_id,))
+        return True
+
+    def create_account_session(self, user_id: str, token_hash: str, expires_at: str) -> None:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            cursor.execute(
+                "INSERT INTO account_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+                (token_hash, user_id, expires_at),
+            )
+
+    def get_account_session(self, token_hash: str) -> dict[str, object] | None:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            row = cursor.execute(
+                "SELECT u.user_id, u.name, a.is_admin FROM account_sessions s "
+                "JOIN user_accounts a ON a.user_id = s.user_id "
+                "JOIN knowledge_users u ON u.user_id = s.user_id "
+                "WHERE s.token_hash = ? AND s.expires_at > ?",
+                (token_hash, datetime.now(timezone.utc).isoformat()),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def revoke_account_session(self, token_hash: str) -> None:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            cursor.execute("DELETE FROM account_sessions WHERE token_hash = ?", (token_hash,))
+
+    def list_knowledge_content_ids(self, user_id: str, kind: str | None = None) -> set[str]:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            if kind:
+                rows = cursor.execute(
+                    "SELECT content_id FROM knowledge_user_content "
+                    "WHERE user_id = ? AND content_kind = ?",
+                    (user_id, kind),
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT content_id FROM knowledge_user_content WHERE user_id = ?",
+                    (user_id,),
+                ).fetchall()
+        return {str(row["content_id"]) for row in rows}
+
+    def list_all_knowledge_video_ids(self) -> set[str]:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            rows = cursor.execute(
+                "SELECT DISTINCT content_id FROM knowledge_user_content "
+                "WHERE content_kind = 'video'"
+            ).fetchall()
+        return {str(row["content_id"]) for row in rows}
+
+    def list_knowledge_video_assets(self, user_id: str) -> list[VideoAssetRecord]:
+        included = self.list_knowledge_content_ids(user_id, "video")
+        return [video for video in self.list_video_assets() if video.video_id in included]
+
+    def set_knowledge_content_membership(
+        self,
+        user_id: str,
+        items: list[tuple[str, str]],
+        included: bool,
+    ) -> int:
+        targets = list(dict.fromkeys(items))
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            if cursor.execute(
+                "SELECT 1 FROM knowledge_users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone() is None:
+                raise ValueError("Knowledge user not found.")
+            for kind, content_id in targets:
+                if kind not in {"video", "article"}:
+                    raise ValueError("Unknown content kind.")
+                table, key = (
+                    ("video_assets", "video_id")
+                    if kind == "video"
+                    else ("knowledge_documents", "document_id")
+                )
+                if cursor.execute(
+                    f"SELECT 1 FROM {table} WHERE {key} = ?",
+                    (content_id,),
+                ).fetchone() is None:
+                    raise ValueError("Content not found.")
+            for kind, content_id in targets:
+                if included:
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO knowledge_user_content (
+                            user_id, content_kind, content_id, category, created_at, updated_at
+                        ) VALUES (?, ?, ?, '', ?, ?)
+                        """,
+                        (user_id, kind, content_id, now, now),
+                    )
+                else:
+                    cursor.execute(
+                        "DELETE FROM knowledge_user_content "
+                        "WHERE user_id = ? AND content_kind = ? AND content_id = ?",
+                        (user_id, kind, content_id),
+                    )
+                    if kind == "video":
+                        cursor.execute(
+                            "DELETE FROM knowledge_user_video_tags "
+                            "WHERE user_id = ? AND video_id = ?",
+                            (user_id, content_id),
+                        )
+        return len(targets)
+
     def list_knowledge_jobs(self, statuses: list[str] | None = None, limit: int = 100) -> list[dict[str, object]]:
         with self._lock, sqlite_cursor(self._connection) as cursor:
             normalized_statuses = [status for status in (statuses or []) if status in {"queued", "running", "aggregating"}]
@@ -843,21 +1344,30 @@ class SqliteTaskRepository:
                 jobs.append(job)
         return jobs
 
-    def create_knowledge_conversation(self, title: str | None = None) -> dict[str, object]:
+    def create_knowledge_conversation(
+        self,
+        title: str | None = None,
+        user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> dict[str, object]:
         now = datetime.now(timezone.utc).isoformat()
         conversation_id = uuid4().hex
         clean_title = str(title or "新会话").strip()[:120] or "新会话"
         with self._lock, sqlite_cursor(self._connection) as cursor:
             cursor.execute(
                 """
-                INSERT INTO knowledge_conversations (conversation_id, title, created_at, updated_at, last_message_at)
-                VALUES (?, ?, ?, ?, NULL)
+                INSERT INTO knowledge_conversations (
+                    conversation_id, user_id, title, created_at, updated_at, last_message_at
+                ) VALUES (?, ?, ?, ?, ?, NULL)
                 """,
-                (conversation_id, clean_title, now, now),
+                (conversation_id, user_id, clean_title, now, now),
             )
-        return self.get_knowledge_conversation(conversation_id) or {}
+        return self.get_knowledge_conversation(conversation_id, user_id) or {}
 
-    def list_knowledge_conversations(self, limit: int = 50) -> list[dict[str, object]]:
+    def list_knowledge_conversations(
+        self,
+        limit: int = 50,
+        user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> list[dict[str, object]]:
         with self._lock, sqlite_cursor(self._connection) as cursor:
             rows = cursor.execute(
                 """
@@ -870,15 +1380,20 @@ class SqliteTaskRepository:
                        ), '') AS preview
                 FROM knowledge_conversations c
                 LEFT JOIN knowledge_messages m ON m.conversation_id = c.conversation_id
+                WHERE c.user_id = ?
                 GROUP BY c.conversation_id
                 ORDER BY COALESCE(c.last_message_at, c.updated_at) DESC
                 LIMIT ?
                 """,
-                (max(1, min(int(limit), 200)),),
+                (user_id, max(1, min(int(limit), 200))),
             ).fetchall()
         return [self._row_to_knowledge_conversation(row) for row in rows]
 
-    def get_knowledge_conversation(self, conversation_id: str) -> dict[str, object] | None:
+    def get_knowledge_conversation(
+        self,
+        conversation_id: str,
+        user_id: str | None = None,
+    ) -> dict[str, object] | None:
         with self._lock, sqlite_cursor(self._connection) as cursor:
             row = cursor.execute(
                 """
@@ -891,32 +1406,43 @@ class SqliteTaskRepository:
                        ), '') AS preview
                 FROM knowledge_conversations c
                 LEFT JOIN knowledge_messages m ON m.conversation_id = c.conversation_id
-                WHERE c.conversation_id = ?
+                WHERE c.conversation_id = ? AND (? IS NULL OR c.user_id = ?)
                 GROUP BY c.conversation_id
                 """,
-                (conversation_id,),
+                (conversation_id, user_id, user_id),
             ).fetchone()
         return self._row_to_knowledge_conversation(row) if row is not None else None
 
-    def update_knowledge_conversation_title(self, conversation_id: str, title: str) -> dict[str, object] | None:
+    def update_knowledge_conversation_title(
+        self,
+        conversation_id: str,
+        title: str,
+        user_id: str | None = None,
+    ) -> dict[str, object] | None:
         clean_title = str(title or "").strip()[:120]
         if not clean_title:
             return None
         updated_at = datetime.now(timezone.utc).isoformat()
         with self._lock, sqlite_cursor(self._connection) as cursor:
             cursor.execute(
-                "UPDATE knowledge_conversations SET title = ?, updated_at = ? WHERE conversation_id = ?",
-                (clean_title, updated_at, conversation_id),
+                "UPDATE knowledge_conversations SET title = ?, updated_at = ? "
+                "WHERE conversation_id = ? AND (? IS NULL OR user_id = ?)",
+                (clean_title, updated_at, conversation_id, user_id, user_id),
             )
             if cursor.rowcount <= 0:
                 return None
-        return self.get_knowledge_conversation(conversation_id)
+        return self.get_knowledge_conversation(conversation_id, user_id)
 
-    def delete_knowledge_conversation(self, conversation_id: str) -> bool:
+    def delete_knowledge_conversation(
+        self,
+        conversation_id: str,
+        user_id: str | None = None,
+    ) -> bool:
         with self._lock, sqlite_cursor(self._connection) as cursor:
             exists = cursor.execute(
-                "SELECT conversation_id FROM knowledge_conversations WHERE conversation_id = ?",
-                (conversation_id,),
+                "SELECT conversation_id FROM knowledge_conversations "
+                "WHERE conversation_id = ? AND (? IS NULL OR user_id = ?)",
+                (conversation_id, user_id, user_id),
             ).fetchone()
             if exists is None:
                 return False
@@ -1102,9 +1628,20 @@ class SqliteTaskRepository:
                 [(job_id, task_id, video_id, position) for task_id, video_id, position in items],
             )
 
-    def get_knowledge_job(self, job_id: str) -> dict[str, object] | None:
+    def get_knowledge_job(
+        self,
+        job_id: str,
+        user_id: str | None = None,
+    ) -> dict[str, object] | None:
         with self._lock, sqlite_cursor(self._connection) as cursor:
-            job = cursor.execute("SELECT * FROM knowledge_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            job = cursor.execute(
+                """
+                SELECT j.* FROM knowledge_jobs j
+                JOIN knowledge_conversations c ON c.conversation_id = j.conversation_id
+                WHERE j.job_id = ? AND (? IS NULL OR c.user_id = ?)
+                """,
+                (job_id, user_id, user_id),
+            ).fetchone()
             if job is None:
                 return None
             items = cursor.execute(
@@ -1316,6 +1853,15 @@ class SqliteTaskRepository:
                 cursor.execute("DELETE FROM task_results WHERE task_id = ?", (task_id,))
             cursor.execute(f"DELETE FROM video_folder_memberships WHERE video_id IN ({placeholders})", tuple(video_ids))
             cursor.execute(f"DELETE FROM video_tags WHERE video_id IN ({placeholders})", tuple(video_ids))
+            cursor.execute(
+                f"DELETE FROM knowledge_user_video_tags WHERE video_id IN ({placeholders})",
+                tuple(video_ids),
+            )
+            cursor.execute(
+                f"DELETE FROM knowledge_user_content WHERE content_kind = 'video' "
+                f"AND content_id IN ({placeholders})",
+                tuple(video_ids),
+            )
             cursor.execute(f"DELETE FROM knowledge_index WHERE video_id IN ({placeholders})", tuple(video_ids))
             cursor.execute(f"DELETE FROM tasks WHERE video_id IN ({placeholders})", tuple(video_ids))
             cursor.execute(f"DELETE FROM video_assets WHERE video_id IN ({placeholders})", tuple(video_ids))
@@ -2475,24 +3021,38 @@ class SqliteTaskRepository:
                         (order, updated_at, item_id, folder_id),
                     )
 
-    def add_video_tag(self, video_id: str, tag: str, source: str = "manual", confidence: float = 1.0) -> bool:
+    def add_video_tag(
+        self,
+        video_id: str,
+        tag: str,
+        source: str = "manual",
+        confidence: float = 1.0,
+        user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> bool:
         normalized_tag = str(tag or "").strip()
         if not normalized_tag:
             return False
 
         created_at = datetime.now(timezone.utc).isoformat()
         with self._lock, sqlite_cursor(self._connection) as cursor:
-            video = cursor.execute("SELECT video_id FROM video_assets WHERE video_id = ?", (video_id,)).fetchone()
+            video = cursor.execute(
+                """
+                SELECT content_id FROM knowledge_user_content
+                WHERE user_id = ? AND content_kind = 'video' AND content_id = ?
+                """,
+                (user_id, video_id),
+            ).fetchone()
             if video is None:
                 return False
             cursor.execute(
                 """
-                INSERT INTO video_tags (video_id, tag, source, confidence, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(video_id, tag) DO UPDATE SET
+                INSERT INTO knowledge_user_video_tags (
+                    user_id, video_id, tag, source, confidence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, video_id, tag) DO UPDATE SET
                     source = CASE
                         WHEN excluded.source = 'manual' THEN 'manual'
-                        ELSE video_tags.source
+                        ELSE knowledge_user_video_tags.source
                     END,
                     confidence = CASE
                         WHEN excluded.source = 'manual' THEN 1.0
@@ -2500,31 +3060,44 @@ class SqliteTaskRepository:
                     END,
                     created_at = CASE
                         WHEN excluded.source = 'manual' THEN excluded.created_at
-                        ELSE video_tags.created_at
+                        ELSE knowledge_user_video_tags.created_at
                     END
                 """,
-                (video_id, normalized_tag, source, float(confidence), created_at),
+                (user_id, video_id, normalized_tag, source, float(confidence), created_at),
             )
         return True
 
-    def remove_video_tag(self, video_id: str, tag: str) -> bool:
+    def remove_video_tag(
+        self,
+        video_id: str,
+        tag: str,
+        user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> bool:
         normalized_tag = str(tag or "").strip()
         if not normalized_tag:
             return False
         with self._lock, sqlite_cursor(self._connection) as cursor:
-            cursor.execute("DELETE FROM video_tags WHERE video_id = ? AND tag = ?", (video_id, normalized_tag))
+            cursor.execute(
+                "DELETE FROM knowledge_user_video_tags "
+                "WHERE user_id = ? AND video_id = ? AND tag = ?",
+                (user_id, video_id, normalized_tag),
+            )
             return cursor.rowcount > 0
 
-    def list_video_tags(self, video_id: str) -> list[VideoTagRecord]:
+    def list_video_tags(
+        self,
+        video_id: str,
+        user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> list[VideoTagRecord]:
         with self._lock, sqlite_cursor(self._connection) as cursor:
             rows = cursor.execute(
                 """
                 SELECT video_id, tag, source, confidence, created_at
-                FROM video_tags
-                WHERE video_id = ?
+                FROM knowledge_user_video_tags
+                WHERE user_id = ? AND video_id = ?
                 ORDER BY source = 'manual' DESC, confidence DESC, tag COLLATE NOCASE ASC
                 """,
-                (video_id,),
+                (user_id, video_id),
             ).fetchall()
         return [
             VideoTagRecord(
@@ -2537,22 +3110,29 @@ class SqliteTaskRepository:
             for row in rows
         ]
 
-    def list_all_tags(self) -> list[dict[str, object]]:
+    def list_all_tags(
+        self,
+        user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> list[dict[str, object]]:
         with self._lock, sqlite_cursor(self._connection) as cursor:
             rows = cursor.execute(
                 """
                 SELECT tag, COUNT(*) AS count
-                FROM video_tags
+                FROM knowledge_user_video_tags
+                WHERE user_id = ?
                 GROUP BY tag
                 ORDER BY count DESC, tag COLLATE NOCASE ASC
-                """
+                """,
+                (user_id,),
             ).fetchall()
             videos_by_tag_rows = cursor.execute(
                 """
                 SELECT tag, video_id
-                FROM video_tags
+                FROM knowledge_user_video_tags
+                WHERE user_id = ?
                 ORDER BY tag COLLATE NOCASE ASC, video_id ASC
-                """
+                """,
+                (user_id,),
             ).fetchall()
         videos_by_tag: dict[str, list[str]] = {}
         for row in videos_by_tag_rows:
@@ -2562,14 +3142,19 @@ class SqliteTaskRepository:
             for row in rows
         ]
 
-    def list_all_video_tags(self) -> list[VideoTagRecord]:
+    def list_all_video_tags(
+        self,
+        user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> list[VideoTagRecord]:
         with self._lock, sqlite_cursor(self._connection) as cursor:
             rows = cursor.execute(
                 """
                 SELECT video_id, tag, source, confidence, created_at
-                FROM video_tags
+                FROM knowledge_user_video_tags
+                WHERE user_id = ?
                 ORDER BY tag COLLATE NOCASE ASC, confidence DESC, video_id ASC
-                """
+                """,
+                (user_id,),
             ).fetchall()
         return [
             VideoTagRecord(
@@ -2582,18 +3167,359 @@ class SqliteTaskRepository:
             for row in rows
         ]
 
-    def list_untagged_video_ids(self) -> list[str]:
+    def list_untagged_video_ids(
+        self,
+        user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> list[str]:
         with self._lock, sqlite_cursor(self._connection) as cursor:
             rows = cursor.execute(
                 """
                 SELECT v.video_id
-                FROM video_assets v
-                LEFT JOIN video_tags t ON t.video_id = v.video_id
-                WHERE t.video_id IS NULL
+                FROM knowledge_user_content c
+                JOIN video_assets v ON v.video_id = c.content_id
+                LEFT JOIN knowledge_user_video_tags t
+                    ON t.user_id = c.user_id AND t.video_id = v.video_id
+                WHERE c.user_id = ? AND c.content_kind = 'video'
+                    AND t.video_id IS NULL
                 ORDER BY v.updated_at DESC
-                """
+                """,
+                (user_id,),
             ).fetchall()
         return [row["video_id"] for row in rows]
+
+    @staticmethod
+    def _knowledge_document_from_row(row: sqlite3.Row) -> KnowledgeDocumentRecord:
+        return KnowledgeDocumentRecord(
+            document_id=row["document_id"],
+            source_url=row["source_url"],
+            canonical_url=row["canonical_url"],
+            source_type=row["source_type"],
+            title=row["title"],
+            author=row["author"] or "",
+            published_at=datetime.fromisoformat(row["published_at"]) if row["published_at"] else None,
+            cover_url=row["cover_url"] or "",
+            content_markdown=row["content_markdown"],
+            plain_text=row["plain_text"],
+            summary_markdown=row["summary_markdown"] or "",
+            image_count=int(row["image_count"] or 0),
+            analyzed_image_count=int(row["analyzed_image_count"] or 0),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def upsert_knowledge_document(
+        self,
+        document: KnowledgeDocumentRecord,
+        user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> KnowledgeDocumentRecord:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            existing = cursor.execute(
+                "SELECT document_id, created_at FROM knowledge_documents WHERE canonical_url = ?",
+                (document.canonical_url,),
+            ).fetchone()
+            document_id = existing["document_id"] if existing else document.document_id
+            created_at = existing["created_at"] if existing else document.created_at.isoformat()
+            cursor.execute(
+                """
+                INSERT INTO knowledge_documents (
+                    document_id, source_url, canonical_url, source_type, title, author,
+                    published_at, cover_url, content_markdown, plain_text, summary_markdown,
+                    image_count, analyzed_image_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(canonical_url) DO UPDATE SET
+                    source_url = excluded.source_url,
+                    source_type = excluded.source_type,
+                    title = excluded.title,
+                    author = excluded.author,
+                    published_at = excluded.published_at,
+                    cover_url = excluded.cover_url,
+                    content_markdown = excluded.content_markdown,
+                    plain_text = excluded.plain_text,
+                    summary_markdown = excluded.summary_markdown,
+                    image_count = excluded.image_count,
+                    analyzed_image_count = excluded.analyzed_image_count,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    document_id,
+                    document.source_url,
+                    document.canonical_url,
+                    document.source_type,
+                    document.title,
+                    document.author,
+                    document.published_at.isoformat() if document.published_at else None,
+                    document.cover_url,
+                    document.content_markdown,
+                    document.plain_text,
+                    document.summary_markdown,
+                    document.image_count,
+                    document.analyzed_image_count,
+                    created_at,
+                    document.updated_at.isoformat(),
+                ),
+            )
+            row = cursor.execute(
+                "SELECT * FROM knowledge_documents WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO knowledge_user_content (
+                    user_id, content_kind, content_id, category, created_at, updated_at
+                ) VALUES (?, 'article', ?, '', ?, ?)
+                """,
+                (user_id, document_id, created_at, document.updated_at.isoformat()),
+            )
+        return self._knowledge_document_from_row(row)
+
+    def consolidate_knowledge_documents(
+        self,
+        canonical_url: str,
+        document_ids: list[str],
+    ) -> tuple[KnowledgeDocumentRecord | None, list[str]]:
+        if not document_ids:
+            return None, []
+        placeholders = ", ".join("?" for _ in document_ids)
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            rows = cursor.execute(
+                f"""
+                SELECT * FROM knowledge_documents
+                WHERE document_id IN ({placeholders})
+                ORDER BY updated_at DESC, created_at ASC, document_id ASC
+                """,
+                document_ids,
+            ).fetchall()
+            if not rows:
+                return None, []
+            primary = rows[0]
+            replaced_document_ids = [row["document_id"] for row in rows[1:]]
+            if replaced_document_ids:
+                duplicate_placeholders = ", ".join("?" for _ in replaced_document_ids)
+                now = datetime.now(timezone.utc).isoformat()
+                cursor.execute(
+                    f"""
+                    INSERT OR IGNORE INTO knowledge_user_content (
+                        user_id, content_kind, content_id, category, created_at, updated_at
+                    )
+                    SELECT user_id, 'article', ?, category, created_at, ?
+                    FROM knowledge_user_content
+                    WHERE content_kind = 'article'
+                        AND content_id IN ({duplicate_placeholders})
+                    """,
+                    (primary["document_id"], now, *replaced_document_ids),
+                )
+                cursor.execute(
+                    f"DELETE FROM knowledge_user_content "
+                    f"WHERE content_kind = 'article' "
+                    f"AND content_id IN ({duplicate_placeholders})",
+                    replaced_document_ids,
+                )
+                cursor.execute(
+                    f"DELETE FROM knowledge_document_index "
+                    f"WHERE document_id IN ({duplicate_placeholders})",
+                    replaced_document_ids,
+                )
+                cursor.execute(
+                    f"DELETE FROM knowledge_documents "
+                    f"WHERE document_id IN ({duplicate_placeholders})",
+                    replaced_document_ids,
+                )
+            if primary["canonical_url"] != canonical_url:
+                cursor.execute(
+                    "UPDATE knowledge_documents SET canonical_url = ? WHERE document_id = ?",
+                    (canonical_url, primary["document_id"]),
+                )
+                primary = cursor.execute(
+                    "SELECT * FROM knowledge_documents WHERE document_id = ?",
+                    (primary["document_id"],),
+                ).fetchone()
+        return self._knowledge_document_from_row(primary), replaced_document_ids
+
+    def get_knowledge_document(
+        self,
+        document_id: str,
+        user_id: str | None = None,
+    ) -> KnowledgeDocumentRecord | None:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            row = cursor.execute(
+                """
+                SELECT d.* FROM knowledge_documents d
+                WHERE d.document_id = ? AND (
+                    ? IS NULL OR EXISTS (
+                        SELECT 1 FROM knowledge_user_content c
+                        WHERE c.user_id = ? AND c.content_kind = 'article'
+                            AND c.content_id = d.document_id
+                    )
+                )
+                """,
+                (document_id, user_id, user_id),
+            ).fetchone()
+        return self._knowledge_document_from_row(row) if row is not None else None
+
+    def get_knowledge_document_by_url(self, canonical_url: str) -> KnowledgeDocumentRecord | None:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            row = cursor.execute(
+                "SELECT * FROM knowledge_documents WHERE canonical_url = ?",
+                (canonical_url,),
+            ).fetchone()
+        return self._knowledge_document_from_row(row) if row is not None else None
+
+    def list_knowledge_documents(
+        self,
+        user_id: str | None = None,
+    ) -> list[KnowledgeDocumentRecord]:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            if user_id is None:
+                rows = cursor.execute(
+                    "SELECT * FROM knowledge_documents ORDER BY updated_at DESC"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    """
+                    SELECT d.* FROM knowledge_documents d
+                    JOIN knowledge_user_content c
+                        ON c.content_kind = 'article' AND c.content_id = d.document_id
+                    WHERE c.user_id = ?
+                    ORDER BY d.updated_at DESC
+                    """,
+                    (user_id,),
+                ).fetchall()
+        return [self._knowledge_document_from_row(row) for row in rows]
+
+    def list_knowledge_content(
+        self,
+        user_id: str = DEFAULT_KNOWLEDGE_USER_ID,
+    ) -> list[dict[str, object]]:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            rows = cursor.execute(
+                """
+                SELECT v.video_id AS id, 'video' AS kind, v.title, v.cover_url,
+                       COALESCE(c.category, '') AS category,
+                       CASE WHEN c.content_id IS NULL THEN 0 ELSE 1 END AS included
+                FROM video_assets v
+                LEFT JOIN knowledge_user_content c
+                    ON c.user_id = ? AND c.content_kind = 'video'
+                    AND c.content_id = v.video_id
+                UNION ALL
+                SELECT d.document_id AS id, 'article' AS kind, d.title, d.cover_url,
+                       COALESCE(c.category, '') AS category,
+                       CASE WHEN c.content_id IS NULL THEN 0 ELSE 1 END AS included
+                FROM knowledge_documents d
+                LEFT JOIN knowledge_user_content c
+                    ON c.user_id = ? AND c.content_kind = 'article'
+                    AND c.content_id = d.document_id
+                ORDER BY included DESC, title, kind, id
+                """,
+                (user_id, user_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def classify_knowledge_content(
+        self,
+        user_id: str,
+        items: list[tuple[str, str]],
+        category: str,
+    ) -> int:
+        targets = list(dict.fromkeys(items))
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            for kind, item_id in targets:
+                if kind not in {"video", "article"}:
+                    raise ValueError("Unknown content kind")
+                if cursor.execute(
+                    """
+                    SELECT 1 FROM knowledge_user_content
+                    WHERE user_id = ? AND content_kind = ? AND content_id = ?
+                    """,
+                    (user_id, kind, item_id),
+                ).fetchone() is None:
+                    raise ValueError("Content not found")
+            for kind, item_id in targets:
+                cursor.execute(
+                    """
+                    UPDATE knowledge_user_content SET category = ?, updated_at = ?
+                    WHERE user_id = ? AND content_kind = ? AND content_id = ?
+                    """,
+                    (
+                        category.strip(),
+                        datetime.now(timezone.utc).isoformat(),
+                        user_id,
+                        kind,
+                        item_id,
+                    ),
+                )
+        return len(targets)
+
+    def get_knowledge_document_count(self, user_id: str | None = None) -> int:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            if user_id is None:
+                row = cursor.execute("SELECT COUNT(*) AS count FROM knowledge_documents").fetchone()
+            else:
+                row = cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM knowledge_user_content
+                    WHERE user_id = ? AND content_kind = 'article'
+                    """,
+                    (user_id,),
+                ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def replace_knowledge_document_chunks(
+        self,
+        document_id: str,
+        chunks: list[KnowledgeDocumentChunkRecord],
+    ) -> int:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            cursor.execute("DELETE FROM knowledge_document_index WHERE document_id = ?", (document_id,))
+            for chunk in chunks:
+                cursor.execute(
+                    """
+                    INSERT INTO knowledge_document_index (
+                        chunk_id, document_id, embedding_json, indexed_content, index_type,
+                        segment_order, anchor_label, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chunk.chunk_id,
+                        chunk.document_id,
+                        chunk.embedding_json,
+                        chunk.indexed_content,
+                        chunk.index_type,
+                        chunk.segment_order,
+                        chunk.anchor_label,
+                        chunk.created_at.isoformat(),
+                        chunk.updated_at.isoformat(),
+                    ),
+                )
+        return len(chunks)
+
+    def clear_knowledge_document_chunks(self) -> None:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            cursor.execute("DELETE FROM knowledge_document_index")
+
+    def get_knowledge_document_chunk_count(
+        self,
+        document_id: str | None = None,
+        user_id: str | None = None,
+    ) -> int:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            if document_id:
+                row = cursor.execute(
+                    "SELECT COUNT(*) AS count FROM knowledge_document_index WHERE document_id = ?",
+                    (document_id,),
+                ).fetchone()
+            elif user_id is not None:
+                row = cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM knowledge_document_index i
+                    JOIN knowledge_user_content c
+                        ON c.content_kind = 'article' AND c.content_id = i.document_id
+                    WHERE c.user_id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()
+            else:
+                row = cursor.execute("SELECT COUNT(*) AS count FROM knowledge_document_index").fetchone()
+        return int(row["count"] if row else 0)
 
     def replace_knowledge_chunks(self, video_id: str, chunks: list[KnowledgeIndexChunkRecord]) -> int:
         with self._lock, sqlite_cursor(self._connection) as cursor:
@@ -2670,9 +3596,20 @@ class SqliteTaskRepository:
             for row in rows
         ]
 
-    def get_knowledge_chunk_count(self) -> int:
+    def get_knowledge_chunk_count(self, user_id: str | None = None) -> int:
         with self._lock, sqlite_cursor(self._connection) as cursor:
-            row = cursor.execute("SELECT COUNT(*) AS count FROM knowledge_index").fetchone()
+            if user_id is None:
+                row = cursor.execute("SELECT COUNT(*) AS count FROM knowledge_index").fetchone()
+            else:
+                row = cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM knowledge_index i
+                    JOIN knowledge_user_content c
+                        ON c.content_kind = 'video' AND c.content_id = i.video_id
+                    WHERE c.user_id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()
         return int(row["count"]) if row is not None else 0
 
     def set_video_favorite(self, video_id: str, is_favorite: bool) -> VideoAssetRecord | None:

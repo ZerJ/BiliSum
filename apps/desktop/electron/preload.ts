@@ -196,6 +196,10 @@ const desktop = {
     captureLoginCookies: () =>
       ipcRenderer.invoke("desktop:bilibili:capture-login-cookies") as Promise<BilibiliCookieExportResult>,
   },
+  douyin: {
+    captureLoginCookies: () =>
+      ipcRenderer.invoke("desktop:douyin:capture-login-cookies") as Promise<BilibiliCookieExportResult>,
+  },
   shell: {
     openPath: (targetPath: string) => ipcRenderer.invoke("desktop:shell:open-path", targetPath) as Promise<string>,
   },

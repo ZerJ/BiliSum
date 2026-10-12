@@ -24,7 +24,7 @@ export const settingsCategories: Array<{
   icon: ReactNode;
 }> = [
   { id: "overview", label: "快速开始", description: "确认能否开始总结，并跳到缺失配置。", group: "workflow", icon: <OverviewIcon /> },
-  { id: "video", label: "视频获取", description: "B 站登录态、下载缓存和临时文件策略。", group: "workflow", icon: <FileTextIcon /> },
+  { id: "video", label: "视频获取", description: "B 站/抖音登录态、下载缓存和临时文件策略。", group: "workflow", icon: <FileTextIcon /> },
   { id: "transcription", label: "语音转文字", description: "选择云端或本地 ASR，配置模型和设备。", group: "workflow", icon: <CpuIcon /> },
   { id: "generation", label: "摘要生成", description: "AI 摘要、模型接入、语言和导图开关。", group: "workflow", icon: <RobotIcon /> },
   { id: "knowledge", label: "知识库与问答", description: "知识库开关、索引策略、问答模型和依赖。", group: "workflow", icon: <StorageIcon /> },

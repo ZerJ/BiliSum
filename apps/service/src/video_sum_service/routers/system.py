@@ -4,6 +4,7 @@ import threading
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from video_sum_core.models.tasks import TaskStatus
 from video_sum_infra.prompt_library import (
     BUILTIN_PRESETS,
@@ -23,10 +24,19 @@ from video_sum_infra.runtime import (
 )
 
 from video_sum_service.auth import (
+    ACCOUNT_COOKIE_NAME,
+    account_from_request,
+    create_account_session,
     describe_token_source,
     extract_bearer_token,
+    hash_password,
+    login_attempt_allowed,
+    record_login_attempt,
     request_is_authorized,
+    require_account,
     set_session_cookie,
+    session_hash,
+    verify_password,
 )
 from video_sum_service.bilibili_cookies import (
     capture_bilibili_cookies_from_browser,
@@ -34,6 +44,7 @@ from video_sum_service.bilibili_cookies import (
     poll_bilibili_login_qrcode,
 )
 from video_sum_service.context import access_token_manager, app_info, logger, settings_manager
+from video_sum_service.site_cookies import import_douyin_cookies
 from video_sum_service.integrations import (
     extract_http_error_detail,
     probe_asr_connection,
@@ -74,6 +85,21 @@ from video_sum_service.schemas import (
 from video_sum_service.settings_manager import SettingsUpdatePayload
 
 router = APIRouter(prefix="/api/v1")
+
+
+class AccountSetupRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    password: str = Field(min_length=8, max_length=256)
+
+
+class AccountLoginRequest(BaseModel):
+    name: str
+    password: str
+
+
+class AccountPasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=256)
 LATEST_RELEASE_URL = "https://api.github.com/repos/lycohana/BiliSum/releases/latest"
 BUILTIN_PROMPT_PRESET_IDS = {preset.id for preset in BUILTIN_PRESETS}
 
@@ -305,14 +331,24 @@ def get_settings(request: Request) -> dict[str, object]:
 
 @router.get("/auth/status")
 def get_auth_status(request: Request) -> dict[str, object]:
+    repository = request.app.state.task_repository
+    if repository.accounts_enabled():
+        account = account_from_request(request)
+        return {
+            "required": True, "setupRequired": False, "authenticated": account is not None,
+            "account": repository.get_knowledge_user(str(account["user_id"])) if account else None,
+        }
     return {
         **describe_token_source(access_token_manager),
-        "authenticated": request_is_authorized(request, access_token_manager),
+        "authenticated": False,
+        "setupRequired": True,
     }
 
 
 @router.post("/auth/session")
 def create_auth_session(request: Request) -> JSONResponse:
+    if request.app.state.task_repository.accounts_enabled():
+        raise HTTPException(status_code=403, detail="已启用账户登录，访问密钥不能用于登录。")
     token = extract_bearer_token(request)
     if not access_token_manager.verify(token):
         raise HTTPException(status_code=401, detail="访问密钥无效。")
@@ -323,6 +359,68 @@ def create_auth_session(request: Request) -> JSONResponse:
         }
     )
     set_session_cookie(response, token or "")
+    return response
+
+
+@router.post("/auth/setup")
+def setup_account(body: AccountSetupRequest, request: Request) -> JSONResponse:
+    repository = request.app.state.task_repository
+    if repository.accounts_enabled():
+        raise HTTPException(status_code=409, detail="管理员账户已经设置。")
+    if not access_token_manager.verify(extract_bearer_token(request)):
+        raise HTTPException(status_code=401, detail="首次设置需要服务访问密钥。")
+    try:
+        account = repository.setup_admin(body.name.strip(), hash_password(body.password))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="该用户名已存在或密码不符合要求。") from exc
+    if account is None:
+        raise HTTPException(status_code=409, detail="管理员账户已经设置。")
+    response = JSONResponse({"required": True, "setupRequired": False, "authenticated": True, "account": account})
+    create_account_session(request, response, str(account["user_id"]))
+    response.delete_cookie("bilisum_session", path="/")
+    return response
+
+
+@router.post("/auth/login")
+def login_account(body: AccountLoginRequest, request: Request) -> JSONResponse:
+    repository = request.app.state.task_repository
+    if not repository.accounts_enabled():
+        raise HTTPException(status_code=409, detail="请先设置管理员账户。")
+    name = body.name.strip()
+    ip = request.client.host if request.client else "unknown"
+    if not login_attempt_allowed(ip, name):
+        raise HTTPException(status_code=429, detail="登录尝试过多，请五分钟后重试。")
+    credentials = repository.get_account_by_name(name)
+    if credentials is None or not verify_password(body.password, str(credentials["password_hash"])):
+        record_login_attempt(ip, name, succeeded=False)
+        raise HTTPException(status_code=401, detail="用户名或密码错误。")
+    record_login_attempt(ip, name, succeeded=True)
+    account = repository.get_knowledge_user(str(credentials["user_id"]))
+    response = JSONResponse({"required": True, "setupRequired": False, "authenticated": True, "account": account})
+    create_account_session(request, response, str(credentials["user_id"]))
+    return response
+
+
+@router.post("/auth/logout")
+def logout_account(request: Request) -> JSONResponse:
+    token = request.cookies.get(ACCOUNT_COOKIE_NAME)
+    if token:
+        request.app.state.task_repository.revoke_account_session(session_hash(token))
+    response = JSONResponse({"authenticated": False})
+    response.delete_cookie(ACCOUNT_COOKIE_NAME, path="/")
+    return response
+
+
+@router.post("/auth/password")
+def change_account_password(body: AccountPasswordRequest, request: Request) -> JSONResponse:
+    account = require_account(request)
+    repository = request.app.state.task_repository
+    credentials = repository.get_account_by_name(str(account["name"]))
+    if credentials is None or not verify_password(body.current_password, str(credentials["password_hash"])):
+        raise HTTPException(status_code=403, detail="当前密码错误。")
+    repository.set_account_password(str(account["user_id"]), hash_password(body.new_password))
+    response = JSONResponse({"updated": True})
+    response.delete_cookie(ACCOUNT_COOKIE_NAME, path="/")
     return response
 
 
@@ -453,6 +551,20 @@ def post_bilibili_cookies_qrcode() -> dict[str, object]:
         return create_bilibili_login_qrcode()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class DouyinCookieImportRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=1024 * 1024)
+
+
+@router.post("/douyin/cookies/import")
+def post_douyin_cookies_import(body: DouyinCookieImportRequest) -> dict[str, object]:
+    try:
+        return import_douyin_cookies(body.content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="登录态保存失败，请检查服务数据目录权限。") from exc
 
 
 @router.get("/bilibili/cookies/qrcode/{qrcode_key}")

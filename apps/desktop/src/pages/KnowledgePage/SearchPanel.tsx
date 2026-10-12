@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
 
-import { SearchIcon } from "../../components/AppIcons";
+import { ExternalLinkIcon, SearchIcon } from "../../components/AppIcons";
 import type { KnowledgeSearchResult, KnowledgeTagItem } from "../../types";
 
 type SearchPanelProps = {
@@ -101,27 +101,35 @@ export function SearchPanel({
           {searching ? <div className="knowledge-empty-state">正在搜索知识库...</div> : null}
           {!searching && !results.length ? (
             <div className="knowledge-empty-state">
-              {query.trim() ? "没有找到更合适的命中结果，可以换个问法或先用标签缩小范围。" : "输入关键词后，这里会展示最相关的视频片段和命中摘要。"}
+              {query.trim() ? "没有找到更合适的命中结果，可以换个问法或先用标签缩小范围。" : "输入关键词后，这里会展示最相关的视频或文章片段。"}
             </div>
           ) : null}
           {results.map((result) => (
-            <article key={`${result.video_id}-${result.timestamp || "na"}`} className="knowledge-result-card">
+            <article key={`${result.source_kind}-${result.source_id}-${result.timestamp || "na"}`} className="knowledge-result-card">
               <div className="knowledge-result-head">
                 <div>
                   <h4>
-                    <Link to={`/videos/${result.video_id}`}>{result.title}</Link>
+                    {result.source_kind === "article" && result.source_id ? (
+                      <Link to={`/knowledge/articles/${encodeURIComponent(result.source_id)}`}>
+                        {result.title}
+                      </Link>
+                    ) : result.source_kind === "article" ? (
+                      <a href={result.source_url} target="_blank" rel="noreferrer">{result.title}<ExternalLinkIcon aria-hidden="true" /></a>
+                    ) : (
+                      <Link to={`/videos/${result.video_id}`}>{result.title}</Link>
+                    )}
                   </h4>
-                  <p>相关度 {Math.round(result.relevance_score * 100)}%{result.timestamp ? ` · ${result.timestamp}` : ""}</p>
+                  <p><span className="knowledge-source-kind">{result.source_kind === "article" ? "文章" : "视频"}</span> · 相关度 {Math.round(result.relevance_score * 100)}%{result.timestamp ? ` · ${result.timestamp}` : ""}</p>
                 </div>
                 <div className="knowledge-result-actions">
-                  <button className="tertiary-button" type="button" onClick={() => onManageTags(result.video_id)}>标签</button>
+                  {result.video_id ? <button className="tertiary-button" type="button" onClick={() => onManageTags(result.video_id!)}>标签</button> : null}
                 </div>
               </div>
               <p className="knowledge-result-snippet">{result.snippet}</p>
               <div className="filter-pill-row">
                 {result.tags.map((tag) => (
                   <button
-                    key={`${result.video_id}-${tag}`}
+                    key={`${result.source_kind}-${result.source_id}-${tag}`}
                     className={`filter-pill ${selectedTags.includes(tag) ? "active" : ""}`}
                     type="button"
                     onClick={() => onToggleTag(tag)}
